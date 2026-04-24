@@ -1,6 +1,6 @@
 # FOP Mouse Microbiome Functional Analysis (HUMAnN)
 
-This repository contains code for the functional metagenomic analyses associated with the submitted manuscript examining the gut microbiome in a mouse model of Fibrodysplasia Ossificans Progressiva (FOP).
+This folder contains code for the functional metagenomic analyses associated with the submitted manuscript examining the gut microbiome in a mouse model of Fibrodysplasia Ossificans Progressiva (FOP).
 
 ## Data Generation
 
