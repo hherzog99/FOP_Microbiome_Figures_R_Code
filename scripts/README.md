@@ -15,10 +15,10 @@ All scripts are written in R and organized to allow reviewers to inspect the rep
 ## scripts/
 R scripts used to perform statistical analyses and generate figures.
 
-- `Anti-IL1 HO Quantification.R`
-- `Cytokine Heatmap.R`
-- `FOP GMA HO Quants.R`
-- `FOP GMA KM Curve.R`
+- `Anti-IL1 HO Quantification.R` --> Figure 4B
+- `Cytokine Heatmap.R`--> Figure 3B
+- `FOP GMA HO Quants.R` --> Figure 2D
+- `FOP GMA KM Curve.R` --> Figure 2F
 
 ## figures/
 
@@ -30,10 +30,6 @@ Includes:
 - Cytokine heatmaps
 - Kaplan–Meier survival curves
 - Statistical summary spreadsheets
-
-## results/
-
-Optional folder for additional outputs or intermediate processed files.
 
 # Reproducibility
 
