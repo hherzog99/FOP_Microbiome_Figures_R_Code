@@ -1,7 +1,7 @@
 # R Code for the FOP Microbiome Paper Stats and Figures
 This repository contains the R code for the FOP microbiome paper figures.
 
-Folders
+## Folders
 
 fop_mouse_microbiome_functional_analysis/
 
