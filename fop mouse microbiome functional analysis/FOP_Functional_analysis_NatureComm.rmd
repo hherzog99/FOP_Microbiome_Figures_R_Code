@@ -1,0 +1,564 @@
+---
+title: "FOP Analysis Rerun"
+author: "Authors: Ethan Dinh"
+date: "2025-10-2"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: '5'
+    df_print: paged
+  html_notebook:
+    theme: spacelab
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: yes 
+      smooth_scroll: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '5'
+---
+
+```{css, echo=FALSE}
+img {
+  align-self: center;
+  height: fit-content;
+}
+
+pre {
+ margin: 20px 0;
+}
+
+.python, .r {
+  background-color: #f8f9fa;
+  border: none;
+  border-radius: 0;
+  padding: 20px;
+}
+
+table {
+  margin: auto;
+  border-top: 1px solid #666;
+  border-bottom: 1px solid #666;
+}
+
+.figure {
+  display: flex;
+  justify-content: center;
+}
+
+table thead th { border-bottom: 1px solid #ddd; }
+th, td { padding: 5px; }
+thead, tfoot, tr:nth-child(even) { background: #eee; }
+```
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = TRUE, message = TRUE)
+```
+
+# Experiment
+In this experiment we will rerun the FOP analysis using the provided dataset and scripts. The goal is to replicate the results and ensure the analysis is reproducible.
+
+# Packages and Directory Setup
+Below we will install the necessary R packages if they are not already installed.
+
+```{r Installing Packages, echo=TRUE, results=FALSE, class.output="code", message=FALSE}
+# Install the necessary packages if not already installed
+base_packages <- c(
+    # Data handling and Preprocessing
+    "readr", "data.table", "dplyr", "tidyr", "tibble", "stringr", "Hmisc", "impute",
+
+    # Visualization
+    "ggplot2", "ggpubr", "ggprism", "plotly",
+    "ComplexHeatmap", "ggVennDiagram", "ggtext",
+
+    # Utilities
+    "broom", "progress", "DT", "shiny", "pbkrtest", "emmeans", "afex", "rstudioapi", "furrr", "future",
+    "progress",
+
+    # Metagenomics
+    "phyloseq", "vegan", "purrr", "taxize"
+)
+
+if (length(setdiff(base_packages, rownames(installed.packages()))) > 0) {
+    install.packages(setdiff(base_packages, rownames(installed.packages())))
+}
+
+# Load Bioconductor packages
+bioc_packages <- c("pheatmap", "DESeq2")
+if (length(setdiff(bioc_packages, rownames(installed.packages()))) > 0) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+    }
+    BiocManager::install(setdiff(bioc_packages, rownames(installed.packages())))
+}
+
+total_packages <- c(base_packages, bioc_packages)
+invisible(lapply(total_packages, function(pkg) {
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}))
+```
+
+## Directory Setup
+Next we will set up the directory structure for the analysis. Data was extracted from the Wynton server and placed in the `data` folder. Here, there are the following directories: 
+* `Kneaddata` - contains the Kneaddata output files (useful for determining the number of host reads)
+* `Kraken2` - contains the Kraken2 report files
+* `Bracken` - contains the relative abundance files generated from Bracken
+* `Humann` - contains the functional profiling files generated from Humann
+In the following functional analysis, we will be using the Humann output files.
+
+```{r Setting Directory Path, echo = TRUE}
+# Set the working directory to the current directory
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# Setting the path to the data and the file name
+data_path <- "../data"
+humann_path <- file.path(data_path, "Humann")
+output_path <- "../results"
+
+# Create the output directory if it doesn't exist
+if (!dir.exists(output_path)) {
+    dir.create(output_path, recursive = TRUE)
+}
+```
+
+# Importing Data
+First, we import the metadata to determine the samples and their respective treatments, timepoints, and groups.
+
+```{r Importing Metadata, echo = TRUE}
+# Import metadata
+metadata <- read.csv(file.path(data_path, "Hsiao_shotgun_mapping_v3_final.csv"), header = TRUE, stringsAsFactors = FALSE) %>%
+    dplyr::rename(SampleID = Sample.name) %>%
+    column_to_rownames("SampleID")
+
+# Import KEGG KO classification table
+ko_details <- read_csv(file.path(data_path, "Overall-KEGG_KO_classification_table_Hsiao_FOP_metagenomics.csv"))
+```
+
+Next, we will import the Humann output files. Here we will import the compiled KO abundance table which is prenormalized to CPMs.
+
+```{r Importing Humann Data, echo = TRUE}
+# Import Humann KO abundance table
+humann_ko_file <- file.path(humann_path, "all_samples_ko_cpm.tsv")
+humann_ko_data <- read_tsv(humann_ko_file)
+```
+
+Next, we will clean the dataset and filter out low-abundance features and samples. Our thresholds will be to retain samples with at least 10% detected features and retain features present in at least 10% of samples.
+
+```{r Cleaning Humann Data, echo = TRUE}
+# Clean column names
+df <- humann_ko_data %>%
+  rename_with(~ gsub("_kneaddata_combined_Abundance-CPM", "", .x)) %>%
+  rename("# Gene Family" = "KO")
+
+# Remove all of the KOs with "|" and "UNMAPPED" or "UNGROUPED" 
+df <- df %>%
+  filter(!str_detect(KO, "\\||UNMAPPED|UNGROUPED")) %>%
+  column_to_rownames("KO")
+
+# Remove excess suffixes from sample names (column names)
+colnames(df) <- stringr::word(colnames(df), 1, -3, sep = "_")
+
+# Remap the column names based on the following mapping
+remap <- c(
+  "1_B11" = "FOP_02",
+  "1_C11" = "CTRL_Abx_08",
+  "1_D11" = "CTRL_Abx_09",
+  "1_E11" = "CTRL_Abx_13",
+  "1_F11" = "FOP_Abx_03",
+  "1_G11" = "FOP_Abx_08"
+)
+colnames(df) <- ifelse(colnames(df) %in% names(remap), remap[colnames(df)], colnames(df))
+
+# Reorganize the data alphabetically by sample names
+df <- df %>% select(sort(colnames(.)))
+
+# Run the filtering steps: retain samples with at least 10% detected features and retain features present in at least 10% of samples
+df <- df %>%
+  select(where(~ mean(. > 0) >= 0.1)) %>%
+  filter(rowSums(. > 0) / ncol(.) >= 0.1)
+```
+
+## Creating Phyloseq Object
+Next, we will create a phyloseq object to facilitate downstream analysis. This will involve creating an OTU table from the KO abundance data and integrating the metadata. Additionally, we will utilize the KO classification table to create a taxonomic table for the phyloseq object. This KO classification table has a depth of 4 level represented as the following in descending order: KO_Class, KO_Subclass, KO_Subclass_2, and KO_name. We will be utilizing KO_Subclass_2 for our differential abundance analysis. However, for the volcano plot visualization, we will be labeling via KO_subclass. 
+
+```{r Creating Phyloseq Object, echo = TRUE}
+# OTU table (KOs as rows)
+otu <- phyloseq::otu_table(as.matrix(df), taxa_are_rows = TRUE)
+
+# Taxonomy table
+# Ensure KO column exists in ko_details
+tax <- ko_details %>%
+  dplyr::filter(KO %in% rownames(df)) %>%
+  column_to_rownames("KO")
+
+# Convert to matrix
+tax <- phyloseq::tax_table(as.matrix(tax))
+
+# Sample metadata
+meta <- metadata %>%
+  dplyr::filter(rownames(metadata) %in% colnames(df)) %>%
+  phyloseq::sample_data()
+
+# Construct phyloseq object
+ps <- phyloseq(otu, tax, meta)
+```
+
+Here we will create an aggregated phyloseq object where the KOs are aggregated at the KO_Subclass_2 level by summing the counts of KOs that belong to the same KO_Subclass_2.
+
+```{r Aggregation}
+# Convert OTU table to data frame
+otu_df <- as.data.frame(otu_table(ps))
+if (!taxa_are_rows(ps)) {
+  otu_df <- t(otu_df)
+}
+
+# Add taxonomy information
+tax_df <- as.data.frame(tax_table(ps)) %>%
+  rownames_to_column("KO")
+
+# Merge counts with taxonomy
+merged_df <- tax_df %>%
+  select(KO, KO_Subclass_2) %>%
+  left_join(otu_df %>% rownames_to_column("KO"), by = "KO")
+
+# Aggregate counts by KO_Subclass_2
+agg_df <- merged_df %>%
+  group_by(KO_Subclass_2) %>%
+  summarise(across(where(is.numeric), \(x) sum(x, na.rm = TRUE))) %>%
+  ungroup()
+
+# Convert back to matrix (KO_Subclass_2 as rownames)
+agg_mat <- as.matrix(agg_df[, -1])
+rownames(agg_mat) <- agg_df$KO_Subclass_2
+
+# Create new taxonomy table (still includes KO_Subclass_2 and higher levels)
+agg_tax <- tax_df %>%
+  distinct(KO_Subclass_2, .keep_all = TRUE) %>%
+  filter(KO_Subclass_2 %in% rownames(agg_mat)) %>%
+  column_to_rownames("KO_Subclass_2") %>%
+  as.matrix() %>%
+  tax_table()
+
+# Build the new phyloseq object
+ps_agg <- phyloseq(
+  otu_table(agg_mat, taxa_are_rows = TRUE),
+  agg_tax,
+  sample_data(ps)
+)
+```
+
+# Functional Analysis
+With the phyloseq object created, we can now proceed with the functional analysis. This will include differential abundance testing and visualizations via volcano plots and heatmaps.
+
+## Differential Abundance Testing
+We will perform differential abundance testing using DESeq2 to identify KOs that are significantly different between the following groups:
+  1. FOP (FOP_t1) vs WT (aka CTRL_t1)
+  2. FOP (FOP_t1 + FOP_t2 + FOP_ABX_t1) vs WT (CTRL_t1 + CTRL_t2 + CTRL_abx_t1)
+  3. FOP (FOP_ABX_t1) vs FOP GMA (FOP_ABX_t2)
+  4. WT (CTRL_ABX_t1) vs WT GMA (Ctrl_abx_t2)
+
+### FOP vs WT
+Here, we are comparing FOP (FOP_t1 + FOP_t2 + FOP_ABX_t1) vs WT (CTRL_t1 + CTRL_t2 + CTRL_abx_t1). To do so, we will utilize the `Group2` variable in the metadata which precomputes these groupings. We will first run the differential abundance testing at the KO level (non-aggregated).
+
+```{r Differential Abundance Testing, echo = TRUE}
+# Filter phyloseq object to only include relevant samples
+ps_filtered <- prune_samples(sample_data(ps)$Type %in% c("CTRL_ABX_T1", "CTRL_T1", "CTRL_T2","FOP_ABX_T1",  "FOP_T1",  "FOP_T2"), ps)
+ps_filtered <- filter_taxa(
+  ps_filtered,
+  function(x) sum(x > 0) > (0.3 * length(x)),
+  prune = TRUE
+)
+
+# Convert to DESeq2 object
+sample_data(ps_filtered)$Group2 <- factor(
+  as.character(sample_data(ps_filtered)$Group2),
+  levels = c("CTRL", "FOP")
+)
+dds <- phyloseq_to_deseq2(ps_filtered, ~ Group2)
+
+# Run DESeq2
+dds <- estimateSizeFactors(dds, type = "poscounts")
+dds <- DESeq(dds, fitType = "local", sfType = "poscounts")
+phy_deseq_1_res <- results(dds, name = "Group2_FOP_vs_CTRL", pAdjustMethod = "fdr")
+
+# Merge results with KO details
+phy_deseq_1_res_df <- as.data.frame(phy_deseq_1_res) %>%
+  rownames_to_column("KO") %>%
+  left_join(ko_details, by = "KO") %>%
+  filter(!is.na(padj))
+
+# Print the number of significant KOs based on an adjusted p-value threshold of 0.05
+significant_kos <- phy_deseq_1_res_df %>% filter(padj < 0.05)
+if (nrow(significant_kos) == 0) {
+  cat("No significant KOs found (adjusted p-value < 0.05).\n")
+} else {
+  cat("Number of significant KOs (adjusted p-value < 0.05):", nrow(significant_kos), "\n")
+}
+```
+
+```{r Volcano Plot FOP vs WT, echo = TRUE, fig.width=12, fig.height=6}
+# Prepare volcano data
+df <- phy_deseq_1_res_df
+
+# Stabilize padj and compute -log10
+eps <- .Machine$double.xmin
+df$padj_fix <- ifelse(
+  is.na(df$padj) | df$padj <= 0,
+  eps,
+  df$padj
+)
+df$neglog10_padj <- -log10(df$padj_fix)
+
+# Axis caps to avoid compression from outliers
+y_cap <- max(
+  stats::quantile(df$neglog10_padj, 0.99, na.rm = TRUE),
+  3
+)
+
+x_cap <- max(
+  stats::quantile(abs(df$log2FoldChange), 0.99, na.rm = TRUE),
+  1.5
+)
+
+# Volcano plot
+vp1 <- ggplot(
+  df,
+  aes(x = log2FoldChange, y = neglog10_padj)
+) +
+  geom_point(
+    color = "grey70",
+    alpha = 0.75,
+    size = 2.5
+  ) +
+  geom_point(
+    data = subset(df, padj_fix < 0.05),
+    aes(color = KO_Subclass),
+    size = 2.8
+  ) +
+  geom_vline(
+    xintercept = 0,
+    color = "grey40",
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    color = "red",
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  labs(
+    title = "Differential Abundance Volcano Plot",
+    x = expression("Log"[2] * " Fold Change (FOP vs WT)"),
+    y = expression("-Log"[10] * "(adj p-value)"),
+    color = "KO Subclass"
+  ) +
+  coord_cartesian(
+    xlim = c(-x_cap, x_cap),
+    ylim = c(0, y_cap)
+  ) +
+  theme_prism(base_size = 16, border = TRUE) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    legend.title = element_text(size = 14),
+    legend.text = element_text(face = "italic", size = 12),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold")
+  )
+
+print(vp1)
+
+# Save to Figures folder
+ggsave(
+  filename = file.path(fig_dir, "Volcano_FOP_vs_WT.pdf"),
+  plot = vp1,
+  device = cairo_pdf,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Volcano_FOP_vs_WT.tiff"),
+  plot = vp1,
+  device = "tiff",
+  compression = "lzw",
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+```{r Pooled FOP_vs_WT Heatmap Averaged, echo=TRUE, fig.width=8, fig.height=8}
+# Significant KOs from pooled FOP vs WT model
+sig_kos <- phy_deseq_1_res_df %>%
+  dplyr::filter(!is.na(padj), padj < 0.05) %>%
+  dplyr::arrange(padj)
+
+cat("Significant KOs (padj < 0.05):", nrow(sig_kos), "\n")
+
+if (nrow(sig_kos) == 0) {
+  stop("No significant KOs; cannot draw heatmap.")
+}
+
+if (!"KO" %in% names(sig_kos)) {
+  stop("phy_deseq_1_res_df must contain a column named 'KO'.")
+}
+
+# Normalized counts from DESeq object
+nc <- DESeq2::counts(dds, normalized = TRUE)
+
+sig_ids <- intersect(sig_kos$KO, rownames(nc))
+nc_sig <- nc[sig_ids, , drop = FALSE]
+
+sig_kos <- sig_kos %>%
+  dplyr::filter(KO %in% sig_ids)
+
+nc_sig <- nc_sig[sig_kos$KO, , drop = FALSE]
+
+# Sample metadata and type renaming
+md <- as.data.frame(sample_data(ps_filtered))
+
+md$TypeRenamed <- md$Type
+md$TypeRenamed <- gsub("^CTRL", "WT", md$TypeRenamed)
+md$TypeRenamed <- gsub("ABX", "GMA", md$TypeRenamed)
+
+keep_types <- c(
+  "WT_T1", "WT_T2", "WT_GMA_T1",
+  "FOP_T1", "FOP_T2", "FOP_GMA_T1"
+)
+
+keep_samples <- rownames(md)[md$TypeRenamed %in% keep_types]
+keep_samples <- intersect(keep_samples, colnames(nc_sig))
+
+nc_sig <- nc_sig[, keep_samples, drop = FALSE]
+md <- md[keep_samples, , drop = FALSE]
+
+# Average across TypeRenamed
+mat_long <- as.data.frame(t(nc_sig))
+mat_long$TypeRenamed <- md$TypeRenamed
+
+mat_avg <- mat_long %>%
+  dplyr::group_by(TypeRenamed) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), mean)) %>%
+  as.data.frame()
+
+rownames(mat_avg) <- mat_avg$TypeRenamed
+mat_avg <- mat_avg[, -1, drop = FALSE]
+
+# KOs as rows, Types as columns
+mat_avg <- t(mat_avg)
+
+desired_order <- c(
+  "WT_T1", "WT_T2", "WT_GMA_T1",
+  "FOP_T1", "FOP_T2", "FOP_GMA_T1"
+)
+desired_order <- desired_order[desired_order %in% colnames(mat_avg)]
+mat_avg <- mat_avg[, desired_order, drop = FALSE]
+
+# Log transform and row z-score
+mat_log <- log10(mat_avg + 1)
+mat_z <- t(scale(t(mat_log)))
+
+# Remove rows that cannot be scaled
+keep_rows <- apply(mat_z, 1, function(x) all(is.finite(x)))
+mat_z <- mat_z[keep_rows, , drop = FALSE]
+sig_kos <- sig_kos[keep_rows, , drop = FALSE]
+
+if (nrow(mat_z) == 0) {
+  stop("No rows remain after filtering non-finite values.")
+}
+
+# Row labels: KO_Name if available, else KO ID
+row_labels <- ifelse(
+  "KO_Name" %in% names(sig_kos) & !is.na(sig_kos$KO_Name) & sig_kos$KO_Name != "",
+  sig_kos$KO_Name,
+  sig_kos$KO
+)
+rownames(mat_z) <- row_labels
+
+# Row annotation: KO_Subclass
+if ("KO_Subclass" %in% names(sig_kos)) {
+  ann_row <- data.frame(KO_Subclass = sig_kos$KO_Subclass)
+  rownames(ann_row) <- rownames(mat_z)
+
+  subclass_lvls <- sort(unique(stats::na.omit(ann_row$KO_Subclass)))
+  subclass_cols <- setNames(
+    scales::hue_pal()(length(subclass_lvls)),
+    subclass_lvls
+  )
+
+  ann_colors <- list(
+    KO_Subclass = subclass_cols,
+    Group = c(WT = "#999999", FOP = "#000000")
+  )
+} else {
+  ann_row <- NULL
+  ann_colors <- list(
+    Group = c(WT = "#999999", FOP = "#000000")
+  )
+}
+
+# Column annotation
+ann_col <- data.frame(
+  Type = colnames(mat_z),
+  Group = ifelse(grepl("^WT", colnames(mat_z)), "WT", "FOP")
+)
+rownames(ann_col) <- colnames(mat_z)
+
+# Plot heatmap
+pal <- colorRampPalette(c("#2166AC", "white", "#B2182B"))
+
+pheatmap::pheatmap(
+  mat_z,
+  color = pal(101),
+  breaks = seq(-3, 3, length.out = 101),
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_row = ann_row,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  fontsize_col = 15,
+  angle_col = 45,
+  border_color = NA,
+  main = "Significant KOs (FOP vs WT pool, averaged by Type)"
+)
+
+# Save heatmap to Figures folder
+ht <- grid::grid.grab()
+
+grDevices::pdf(
+  file = file.path(fig_dir, "Pooled_FOP_vs_WT_KO_heatmap.pdf"),
+  width = 10,
+  height = 12,
+  useDingbats = FALSE
+)
+grid::grid.draw(ht)
+dev.off()
+
+grDevices::tiff(
+  file = file.path(fig_dir, "Pooled_FOP_vs_WT_KO_heatmap.tiff"),
+  width = 10,
+  height = 12,
+  units = "in",
+  res = 300,
+  compression = "lzw"
+)
+grid::grid.draw(ht)
+dev.off()
+
+# Optional: save matrix used in heatmap
+write.csv(
+  mat_z,
+  file = file.path(fig_dir, "Pooled_FOP_vs_WT_KO_heatmap_matrix.csv")
+)
+```
