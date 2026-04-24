@@ -1,0 +1,257 @@
+---
+title: "MMP-9 Plots for 2026 FOP GMA Paper"
+author: "Natasha Hunt"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r load libraries}
+library(ggplot2)
+library(ggtext)
+library(effsize)
+library(readxl)
+library(ape)
+library(effectsize)
+library(ggrepel)
+library(ggsignif)
+library(R.utils)
+library(cowplot)
+library(reshape2)
+library(dplyr)
+library(textshape)
+library(readr)
+library(readxl)
+library(lme4)
+library(tidyverse)
+library(ggpubr)
+```
+
+
+
+```{r load data, echo=FALSE}
+rm(list = ls())
+
+data <- read_excel("MMP9_data.xlsx")
+
+# Clean NAs from specified columns
+data <- data %>%
+  filter(!is.na(GENOTYPE) & !is.na(CONDITION) & !is.na(SEX) & !is.na(MMP9))
+
+# Create grouped genotype: combine WT, Pdgfra, and ACVR1 into "Control"
+data <- data %>%
+  mutate(GENOTYPE_GROUPED = ifelse(GENOTYPE %in% c("WT", "Pdgfra", "ACVR1"), "Control", as.character(GENOTYPE)))
+
+# Factor GENOTYPE with specified levels
+data$GENOTYPE <- factor(data$GENOTYPE, levels = c("WT", "FOP", "Pdgfra", "ACVR1"))
+data$GENOTYPE_GROUPED <- factor(data$GENOTYPE_GROUPED, levels = c("Control", "FOP"))
+data$CONDITION <- factor(data$CONDITION, levels = c("CONTROL", "ABX"))
+data$SEX <- factor(data$SEX)
+```
+
+```{r shared parameters}
+# y and x axis text/titles
+yaxis = 20
+ytext = 16
+xaxis = 16
+linesize = 1.5
+
+# genotype colors (updated from treatment_colors)
+genotype_colors <- c("WT" = "red", "FOP" = "#00008B", "Pdgfra" = "#ff7f0e", "ACVR1" = "#2ca02c")
+
+# grouped genotype colors
+grouped_colors <- c("Control" = "red", "FOP" = "#00008B")
+
+# figure dimensions
+width2 = 8
+width3 = 9.5
+width4 = 11
+heightAll = 12
+
+# location for saving figure 
+outputfolder = '/Users/nhunt/Desktop/hernandez_lab/projects/2026_MMP9_FOP_Project/r_figures'
+dpi = 300
+```
+
+
+```{r boxplot male}
+# Filter data for males
+data_male <- data %>% filter(SEX == "MALE")
+
+# Create boxplot for males with grouped genotypes
+MMP9_male_plot <- ggplot(data_male, aes(x = CONDITION, y = MMP9)) +
+  geom_boxplot(coef = Inf, fill = "white", outlier.shape = NA, size = 1.1, show.legend = FALSE) +
+  geom_jitter(aes(fill = GENOTYPE), position = position_jitter(0.2), size = 3, shape = 21) +
+  labs(x = NULL, y = "Serum MMP-9 (ng/mL)", title = "Male") + 
+  theme_classic(base_size = 16) + 
+  ylim(0,125)+
+  theme(axis.line = element_line(size = linesize)) +
+  scale_fill_manual(values = genotype_colors, name = "Genotype") +
+  scale_x_discrete(labels = c("CONTROL" = "Control", "ABX" = "GMA"))+
+  theme(
+    axis.text.y = element_text(size = ytext),
+    axis.text.x = element_text(size = xaxis),
+    axis.title.y = element_text(size = yaxis),
+    axis.title.x = element_text(size = xaxis),
+    plot.title = element_text(size = yaxis, hjust = 0.5)
+  )
+
+print(MMP9_male_plot)
+ggsave(file.path(outputfolder, 'MMP9_Male_Boxplot.tiff'), 
+       width = width4, height = heightAll, units = 'cm', dpi = dpi)
+```
+
+```{r boxplot female}
+# Filter data for females
+data_female <- data %>% filter(SEX == "FEMALE")
+
+# Create boxplot for females with grouped genotypes
+MMP9_female_plot <- ggplot(data_female, aes(x = CONDITION, y = MMP9)) +
+  geom_boxplot(coef = Inf, fill = "white", outlier.shape = NA, size = 1.1, show.legend = FALSE) +
+  geom_jitter(aes(fill = GENOTYPE), position = position_jitter(0.2), size = 3, shape = 21) +
+  labs(x = NULL, y = "Serum MMP-9 (ng/mL)", title = "Female") + 
+  theme_classic(base_size = 16) + 
+  ylim(0,125)+
+  theme(axis.line = element_line(size = linesize)) +
+  scale_fill_manual(values = genotype_colors, name = "Genotype") +
+  scale_x_discrete(labels = c("CONTROL" = "Control", "ABX" = "GMA"))+
+  theme(
+    axis.text.y = element_text(size = ytext),
+    axis.text.x = element_text(size = xaxis),
+    axis.title.y = element_text(size = yaxis),
+    axis.title.x = element_text(size = xaxis),
+    plot.title = element_text(size = yaxis, hjust = 0.5)
+  )
+
+print(MMP9_female_plot)
+ggsave(file.path(outputfolder, 'MMP9_Female_Boxplot.tiff'), 
+       width = width4, height = heightAll, units = 'cm', dpi = dpi)
+
+one.wayAnovaMaxLoad <- aov(MMP9 ~GENOTYPE_GROUPED*SEX, data = data)
+summary(one.wayAnovaMaxLoad)
+TukeyHSD(one.wayAnovaMaxLoad, conf.level = 0.95)
+```
+```{r boxplot male grouped Control genotype}
+# Group WT, Pdgfra, and ACVR1 into the 'Control' group
+
+# Filter data for males
+data_male <- data %>% filter(SEX == "MALE")
+
+# Create boxplot for males with grouped genotypes
+MMP9_male_plot <- ggplot(data_male, aes(x = CONDITION, y = MMP9)) +
+  geom_boxplot(coef = Inf, fill = "white", outlier.shape = NA, size = 1.1, show.legend = FALSE) +
+  geom_jitter(aes(fill = GENOTYPE_GROUPED), position = position_jitter(0.2), size = 3, shape = 21) +
+  labs(x = NULL, y = "Serum MMP-9 (ng/mL)", title = "Male") + 
+  theme_classic(base_size = 16) + 
+  ylim(0,125)+
+  theme(axis.line = element_line(size = linesize)) +
+  scale_fill_manual(values = grouped_colors, name = "Genotype") +
+  scale_x_discrete(labels = c("CONTROL" = "Control", "ABX" = "GMA"))+
+  theme(
+    axis.text.y = element_text(size = ytext),
+    axis.text.x = element_text(size = xaxis),
+    axis.title.y = element_text(size = yaxis),
+    axis.title.x = element_text(size = xaxis),
+    plot.title = element_text(size = yaxis, hjust = 0.5)
+  )
+
+print(MMP9_male_plot)
+ggsave(file.path(outputfolder, 'MMP9_Male_Boxplot_Grouped.tiff'), 
+       width = width4, height = heightAll, units = 'cm', dpi = dpi)
+```
+
+```{r boxplot female 2}
+
+# Group WT, Pdgfra, and ACVR1 into the 'Control' group
+
+# Filter data for females
+data_female <- data %>% filter(SEX == "FEMALE")
+
+# Create boxplot for females with grouped genotypes
+MMP9_female_plot <- ggplot(data_female, aes(x = CONDITION, y = MMP9)) +
+  geom_boxplot(coef = Inf, fill = "white", outlier.shape = NA, size = 1.1, show.legend = FALSE) +
+  geom_jitter(aes(fill = GENOTYPE_GROUPED), position = position_jitter(0.2), size = 3, shape = 21) +
+  labs(x = NULL, y = "Serum MMP-9 (ng/mL)", title = "Female") + 
+  theme_classic(base_size = 16) + 
+  ylim(0,125)+
+  theme(axis.line = element_line(size = linesize)) +
+  scale_fill_manual(values = grouped_colors, name = "Genotype") +
+  scale_x_discrete(labels = c("CONTROL" = "Control", "ABX" = "GMA"))+
+  theme(
+    axis.text.y = element_text(size = ytext),
+    axis.text.x = element_text(size = xaxis),
+    axis.title.y = element_text(size = yaxis),
+    axis.title.x = element_text(size = xaxis),
+    plot.title = element_text(size = yaxis, hjust = 0.5)
+  )
+
+print(MMP9_female_plot)
+ggsave(file.path(outputfolder, 'MMP9_Female_Boxplot_Grouped.tiff'), 
+       width = width4, height = heightAll, units = 'cm', dpi = dpi)
+
+
+```
+
+
+```{r boxplot both sexes}
+# Group WT, Pdgfra, and ACVR1 into the 'Control' group
+# Group males and females
+
+# Create boxplot for males/females with grouped genotypes
+MMP9_combo_plot <- ggplot(data, aes(x = CONDITION, y = MMP9)) +
+  geom_boxplot(coef = Inf, fill = "white", outlier.shape = NA, size = 1.1, show.legend = FALSE) +
+  geom_jitter(aes(fill = GENOTYPE_GROUPED), position = position_jitter(0.2), size = 3, shape = 21) +
+  labs(x = NULL, y = "Serum MMP-9 (ng/mL)") + 
+  theme_classic(base_size = 16) + 
+  ylim(0,125)+
+  theme(axis.line = element_line(size = linesize)) +
+  scale_fill_manual(values = grouped_colors, name = "Genotype") +
+  scale_x_discrete(labels = c("CONTROL" = "WT", "ABX" = "GMA"))+
+  scale_fill_manual(values = grouped_colors, name = "Genotype", labels = c("Control" = "WT", "FOP" = "FOP"))+
+  theme(
+    axis.text.y = element_text(size = ytext),
+    axis.text.x = element_text(size = xaxis),
+    axis.title.y = element_text(size = yaxis),
+    axis.title.x = element_text(size = xaxis),
+    plot.title = element_text(size = yaxis, hjust = 0.5)
+  )
+
+print(MMP9_combo_plot)
+ggsave(file.path(outputfolder, 'MMP9_Boxplot_both_sexes.tiff'), 
+       width = width4, height = heightAll, units = 'cm', dpi = dpi)
+
+# stats
+CGmodel <- glm(MMP9 ~  (CONDITION*GENOTYPE_GROUPED + (1 | CAGE)), 
+              data = data, 
+              family = gaussian())  # or appropriate family
+
+summary(CGmodel)
+
+library(lme4)
+
+model <- lmer(MMP9 ~ CONDITION * GENOTYPE_GROUPED + (1 | CAGE),
+              data = data)
+
+summary(model)
+
+library(dplyr)
+cage_summary <- data %>%
+  group_by(CAGE, CONDITION) %>%
+  summarise(mean_MMP9 = mean(MMP9), sd_MMP9 = sd(MMP9), n = n(), .groups = "drop")
+print(cage_summary)
+
+library(ggplot2)
+ggplot(data, aes(x = CAGE, y = MMP9, color = CONDITION)) +
+  geom_jitter(width = 0.1, height = 0) +
+  stat_summary(fun=mean, geom="point", size=3)
+
+```
