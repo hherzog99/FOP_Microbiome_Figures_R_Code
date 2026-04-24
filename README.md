@@ -2,6 +2,7 @@
 This repository contains the R code for the FOP microbiome paper figures.
 
 Folders
+
 fop_mouse_microbiome_functional_analysis/
 
 Contains R scripts for downstream analysis of functional shotgun metagenomic sequencing data.
