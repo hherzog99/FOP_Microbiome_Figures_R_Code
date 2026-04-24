@@ -1,0 +1,2415 @@
+---
+title: "FOP Analysis Rerun"
+author: "Authors: Ethan Dinh"
+date: "2025-10-2"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: '5'
+    df_print: paged
+  html_notebook:
+    theme: spacelab
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: yes 
+      smooth_scroll: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '5'
+---
+
+```{css, echo=FALSE}
+img {
+  align-self: center;
+  height: fit-content;
+}
+
+pre {
+ margin: 20px 0;
+}
+
+.python, .r {
+  background-color: #f8f9fa;
+  border: none;
+  border-radius: 0;
+  padding: 20px;
+}
+
+table {
+  margin: auto;
+  border-top: 1px solid #666;
+  border-bottom: 1px solid #666;
+}
+
+.figure {
+  display: flex;
+  justify-content: center;
+}
+
+table thead th { border-bottom: 1px solid #ddd; }
+th, td { padding: 5px; }
+thead, tfoot, tr:nth-child(even) { background: #eee; }
+```
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = TRUE, message = TRUE)
+```
+
+# Experiment
+In this experiment we will rerun the FOP analysis using the provided dataset and scripts. The goal is to replicate the results and ensure the analysis is reproducible.
+
+# Packages and Directory Setup
+Below we will install the necessary R packages if they are not already installed.
+
+```{r Installing Packages, echo=TRUE, results=FALSE, class.output="code", message=FALSE}
+# Install the necessary packages if not already installed
+base_packages <- c(
+    # Data handling and Preprocessing
+    "readr", "data.table", "dplyr", "tidyr", "tibble", "stringr", "Hmisc", "impute",
+
+    # Visualization
+    "ggplot2", "ggpubr", "ggprism", "plotly",
+    "ComplexHeatmap", "ggVennDiagram", "ggtext",
+
+    # Utilities
+    "broom", "progress", "DT", "shiny", "pbkrtest", "emmeans", "afex", "rstudioapi", "furrr", "future",
+    "progress",
+
+    # Metagenomics
+    "phyloseq", "vegan", "purrr", "taxize"
+)
+
+if (length(setdiff(base_packages, rownames(installed.packages()))) > 0) {
+    install.packages(setdiff(base_packages, rownames(installed.packages())))
+}
+
+# Load Bioconductor packages
+bioc_packages <- c("pheatmap", "DESeq2")
+if (length(setdiff(bioc_packages, rownames(installed.packages()))) > 0) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+    }
+    BiocManager::install(setdiff(bioc_packages, rownames(installed.packages())))
+}
+
+total_packages <- c(base_packages, bioc_packages)
+invisible(lapply(total_packages, function(pkg) {
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}))
+```
+
+## Directory Setup
+Next we will set up the directory structure for the analysis. Data was extracted from the Wynton server and placed in the `data` folder. Here, there are the following directories: 
+* `Kneaddata` - contains the Kneaddata output files (useful for determining the number of host reads)
+* `Kraken2` - contains the Kraken2 report files
+* `Bracken` - contains the relative abundance files generated from Bracken
+
+```{r Setting Directory Path, echo = TRUE}
+# Set the working directory to the current directory
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# Setting the path to the data and the file name
+data_path <- "../data"
+kraken_path <- file.path(data_path, "Kraken2")
+bracken_path <- file.path(data_path, "BrackenComplete")
+kneaddata_path <- file.path(data_path, "Kneaddata")
+output_path <- "../results"
+
+# Create the output directory if it doesn't exist
+if (!dir.exists(output_path)) {
+    dir.create(output_path, recursive = TRUE)
+}
+```
+
+# Importing Data
+To generate Bray-Curtis dissimilarity plots, we need to import the relative abundance files from Bracken. Since each sample has a separate file, we will read in all of the files and combine them into a single data frame.
+
+First, we import the metadata to determine the samples and their respective treatments, timepoints, and groups.
+
+```{r Importing Metadata, echo = TRUE}
+# Import metadata
+metadata <- read.csv(file.path(data_path, "Hsiao_shotgun_mapping_v3_final.csv"), header = TRUE, stringsAsFactors = FALSE) %>%
+    dplyr::rename(SampleID = Sample.name) %>%
+    column_to_rownames("SampleID")
+```
+
+Next, we import the Bracken data. We will read in all of the files in the Bracken directory that end with `_S.tsv`, extract the sample name from the file name, and combine them into a single data frame. We will also relabel the samples to match the metadata.
+
+```{r Importing Bracken Data, echo = TRUE}
+# Define input directory and taxonomy levels
+bracken_dir <- file.path(data_path, "BrackenComplete")
+levels <- c("D", "K", "P", "C", "O", "F", "G", "S")
+
+# Read and combine all Bracken files into one table per level
+read_bracken_level <- function(level) {
+    files <- list.files(bracken_dir, pattern = paste0("_bracken_", level, "\\.tsv$"), full.names = TRUE)
+    df <- map_dfr(files, function(f) {
+        sample_id <- str_replace(basename(f), paste0("_bracken_", level, "\\.tsv$"), "")
+        read_tsv(f, show_col_types = FALSE) %>%
+          select(name, taxonomy_id, new_est_reads, fraction_total_reads) %>%
+          mutate(Sample = sample_id, Level = level)
+        })
+    return(df)
+}
+
+bracken_all <- map_dfr(levels, read_bracken_level) %>%
+    dplyr::mutate(Sample = stringr::word(Sample, 1, -3, sep = "_"))
+
+# Relabeling Samples
+bracken_all$Sample <- gsub("1_B11", "FOP_02", bracken_all$Sample)
+bracken_all$Sample <- gsub("1_C11", "CTRL_Abx_08", bracken_all$Sample)
+bracken_all$Sample <- gsub("1_D11", "CTRL_Abx_09", bracken_all$Sample)
+bracken_all$Sample <- gsub("1_E11", "CTRL_Abx_13", bracken_all$Sample)
+bracken_all$Sample <- gsub("1_F11", "FOP_Abx_03", bracken_all$Sample)
+bracken_all$Sample <- gsub("1_G11", "FOP_Abx_08", bracken_all$Sample)
+
+# Separate treatment from replicate number. The replicate is the last item after the underscore and the treatment is everything before it. Keep both.
+bracken_all <- bracken_all %>%
+    dplyr::mutate(sampleID = Sample) %>%
+    separate(Sample, into = c("Treatment", "Replicate"), sep = "_(?=[^_]+$)")
+
+# Reshape Bracken Data to Wide Format
+bracken_wide <- bracken_all %>%
+    select(taxonomy_id, sampleID, new_est_reads) %>%
+    pivot_wider(
+        names_from = sampleID,
+        values_from = new_est_reads,
+        values_fill = 0
+    )
+
+# Select the species level data
+bracken_species <- bracken_wide %>%
+    filter(taxonomy_id %in% bracken_all$taxonomy_id[bracken_all$Level == "S"])
+
+# Create OTU table
+otu_table_df <- bracken_species %>%
+    column_to_rownames("taxonomy_id") %>%
+    as.matrix()
+```
+
+## Creating Taxonomic Tree
+To create a taxonomic tree, we need to retrieve the taxonomic lineage for each species in our OTU table. We will use the `taxize` package to query the NCBI taxonomy database. This allows us to trace each species back to its higher taxonomic ranks (e.g., genus, family, order, etc.). When running this code, note that NCBI may throttle requests if too many are made in a short period of time. To avoid this, we will implement caching to store previously retrieved taxonomic lineages. Additionally, a delay will be added between requests to further reduce the risk of throttling.
+
+```{r Creating Taxonomic Tree, echo = TRUE, warning=FALSE}
+# --- Extract taxids ---
+species_taxids <- rownames(otu_table_df)
+species_taxids <- as.numeric(species_taxids)
+
+# --- Config ---
+cache_file <- file.path(data_path, "taxonomy_cache.rds")
+
+if (file.exists(cache_file)) {
+    message("Loading cached taxonomy results...")
+    lineage_list <- readRDS(cache_file)
+    done <- names(lineage_list)
+} else {
+    message("Querying NCBI taxonomy via taxize...")
+    lineage_list <- list()
+    done <- character(0)
+}
+
+# Ensure that all of the done taxids have data and not NULL
+for (tid in done) {
+    if (is.null(lineage_list[[tid]][1])) {
+        done <- setdiff(done, tid)
+    }
+}
+
+# Checking for the remaining taxids after cache load
+remaining <- setdiff(as.character(species_taxids), done)
+if (length(remaining) > 0) {
+    for (tid in remaining) {
+        Sys.sleep(0.2)
+        res <- tryCatch(
+            classification(tid, db = "ncbi"),
+            error = function(e) {
+              message("Skipping taxid ", tid, ": ", e$message)
+              NULL
+            }
+        )
+        lineage_list[[as.character(tid)]] <- res
+        saveRDS(lineage_list, cache_file)
+    }
+    
+    message("Finished taxonomy retrieval. Saved to: ", cache_file)
+} else {
+    message("All taxids were found in cache.")
+}
+```
+Once we have the taxonomy data retreived, we need to reshape it into Hierarchical Table format.
+
+```{r Reshaping Kraken Data, echo = TRUE}
+taxonomy_table <- map_dfr(names(lineage_list), function(tid) {
+    x <- lineage_list[[tid]][[1]]  # unwrap the inner data.frame
+    
+    if (is.null(x) || !"rank" %in% names(x)) return(NULL)
+    
+    # Extract each level if it exists
+    tibble(
+        taxonomy_id = tid,
+        Kingdom = x$name[x$rank %in% c("superkingdom", "domain")][1],
+        Phylum  = x$name[x$rank == "phylum"][1],
+        Class   = x$name[x$rank == "class"][1],
+        Order   = x$name[x$rank == "order"][1],
+        Family  = x$name[x$rank == "family"][1],
+        Genus   = x$name[x$rank == "genus"][1],
+        Species = x$name[x$rank == "species"][1]
+    )
+})
+
+taxonomy_mat <- taxonomy_table %>%
+    column_to_rownames("taxonomy_id") %>%
+    as.matrix()
+```
+
+Now that we have the taxonomy information, we can merge it with the Bracken data to create a complete data frame that includes species names, estimated reads, treatment groups, and replicate numbers.
+
+```{r Merging Bracken and Taxonomy Data, echo = TRUE}
+common_ids <- intersect(rownames(otu_table_df), rownames(taxonomy_mat))
+otu_table_df <- otu_table_df[common_ids, , drop = FALSE]
+taxonomy_mat <- taxonomy_mat[common_ids, , drop = FALSE]
+```
+
+## Creating Phyloseq Object
+To perform downstream analyses, we will create a Phyloseq object using the OTU table we just created. We will also create a sample metadata table to include treatment information.
+
+```{r Creating Phyloseq Object, echo = TRUE}
+ps <- phyloseq(
+    otu_table(otu_table_df, taxa_are_rows = TRUE),
+    tax_table(taxonomy_mat),
+    sample_data(metadata)
+)
+
+# Filter low-abundance taxa
+ps <- filter_taxa(ps, function(x) sum(x > 0) > (0.1 * length(x)), TRUE)
+```
+
+# Data Normalization
+Before performing any analyses, we need to normalize the data to account for differences in sequencing depth across samples. We will use VST (Variance Stabilizing Transformation) from the DESeq2 package for normalization.
+
+```{r Data Normalization, echo = TRUE, message=FALSE}
+ps_vst <- ps %>% tax_glom(taxrank = "Species")
+ps_deseq2 <- phyloseq_to_deseq2(ps_vst, ~1)
+ps_deseq2_norm <- estimateSizeFactors(ps_deseq2, type = "poscounts")
+otu_table(ps_vst) <- otu_table(counts(ps_deseq2_norm, normalized = TRUE), taxa_are_rows = TRUE)
+```
+
+#QC Plots
+
+```{r QC plots, echo = TRUE, message=FALSE}
+# Helper: 
+clean_names_simple <- function(x) {
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x
+}
+
+# Paths
+knead_dir <- kneaddata_path
+map_path  <- file.path(data_path, "Hsiao_shotgun_mapping_v3_final.csv")
+
+# Read metadata
+meta <- read_csv(map_path, show_col_types = FALSE)
+names(meta) <- clean_names_simple(names(meta))
+
+stopifnot("sample_name" %in% names(meta))
+
+meta <- meta %>%
+  mutate(sample_name = as.character(sample_name))
+
+# Read one kneaddata read_count file
+read_knead_readcount <- function(fp) {
+  x <- read_tsv(fp, col_names = FALSE, show_col_types = FALSE)
+
+  # Row 1 contains headers
+  hdr <- as.character(unlist(x[1, ]))
+  hdr <- clean_names_simple(hdr)
+
+  # Row 2 contains values
+  vals <- x[2, ]
+  out <- as_tibble(vals)
+  names(out) <- hdr
+
+  if (!"sample" %in% names(out)) {
+    stop("No 'sample' column detected after parsing: ", fp)
+  }
+
+  out <- out %>%
+    mutate(sample = as.character(sample)) %>%
+    mutate(across(-sample, ~ suppressWarnings(as.numeric(.x))))
+
+  out
+}
+
+# Load all kneaddata files
+files <- list.files(
+  knead_dir,
+  pattern = "kneaddata\\.read_count\\.tsv$",
+  full.names = TRUE
+)
+
+knead_wide <- purrr::map_dfr(files, read_knead_readcount)
+
+# Kneaddata sample names look like CTRL_01_S3_L003, metadata uses CTRL_01
+knead_wide <- knead_wide %>%
+  mutate(sample_name = gsub("_S\\d+_L\\d+$", "", sample))
+
+# Join to metadata
+qc <- knead_wide %>%
+  left_join(meta, by = "sample_name")
+
+cat("\n--- JOIN CHECK ---\n")
+cat("kneaddata samples:", n_distinct(knead_wide$sample_name), "\n")
+cat("metadata samples:", n_distinct(meta$sample_name), "\n")
+cat("joined samples w/ metadata:", sum(!is.na(qc$group)), "\n")
+
+# Create QC summary table
+qc_slim <- qc %>%
+  transmute(
+    sample_name,
+    group = group,
+    input_reads   = raw_pair1,
+    trimmed_reads = trimmed_pair1,
+    final_reads   = final_pair1,
+    pct_removed   = 100 * (input_reads - final_reads) / input_reads
+  ) %>%
+  filter(!is.na(input_reads) & !is.na(final_reads))
+```
+```{r shotgun-qc, echo=TRUE, message=TRUE, warning=TRUE, fig.width=8, fig.height=6, fig.show="hold"}
+# Figures output folder
+fig_dir <- "Figures"
+
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE)
+}
+
+# Plot: Kneaddata read counts by stage
+qc_long <- qc_slim %>%
+  pivot_longer(
+    cols = c(input_reads, trimmed_reads, final_reads),
+    names_to = "stage",
+    values_to = "reads"
+  ) %>%
+  mutate(
+    stage = factor(
+      stage,
+      levels = c("input_reads", "trimmed_reads", "final_reads"),
+      labels = c("Input", "Trimmed", "Final")
+    )
+  )
+
+p_reads <- ggplot(qc_long, aes(x = sample_name, y = reads, fill = stage)) +
+  geom_col() +
+  labs(
+    title = "Kneaddata Read Counts by Stage",
+    x = "Sample",
+    y = "Reads",
+    fill = "Stage"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
+    axis.ticks.x = element_blank()
+  )
+
+print(p_reads)
+
+# Save figure
+ggsave(
+  filename = file.path(fig_dir, "QC_Kneaddata_Reads_By_Stage.pdf"),
+  plot = p_reads,
+  width = 10,
+  height = 5,
+  device = "pdf"
+)
+```
+
+# Data Analysis
+
+## Taxonomic diversity analysis 
+Here we will calculate and plot the alpha and beta diversity metrics.
+
+### Alpha Diversity
+Here we calculate and plot the alpha diversity metrics (Richness and Shannon Diversity Index) for each sample group. We will use boxplots to visualize the differences between groups and perform statistical tests to assess significance.
+
+```{r Alpha Diversity, echo = TRUE, message=FALSE, fig.width=12, fig.height=6}
+# Build diversity dataframe
+df <- data.frame(sample_data(ps_vst))
+df$Richness <- vegan::specnumber(t(otu_table(ps_vst)))
+df$Shannon  <- vegan::diversity(t(otu_table(ps_vst)), index = "shannon")
+
+# Pretty labels
+label_map <- c(
+  "CTRL_T1"     = "WT t1",
+  "CTRL_T2"     = "WT t2",
+  "FOP_T1"      = "FOP t1",
+  "FOP_T2"      = "FOP t2",
+  "CTRL_ABX_T1" = "WT GMA t1",
+  "CTRL_ABX_T2" = "WT GMA t2",
+  "FOP_ABX_T1"  = "FOP GMA t1",
+  "FOP_ABX_T2"  = "FOP GMA t2"
+)
+
+df$TypePretty <- factor(
+  label_map[as.character(df$Type)],
+  levels = c(
+    "WT t1", "WT t2",
+    "FOP t1", "FOP t2",
+    "WT GMA t1", "WT GMA t2",
+    "FOP GMA t1", "FOP GMA t2"
+  )
+)
+
+# Helpers
+  safe_wilcox <- function(y, g) {
+  g <- droplevels(factor(g))
+  if (length(unique(na.omit(g))) != 2) return(NA_real_)
+  tryCatch(wilcox.test(y ~ g, exact = FALSE)$p.value, error = function(e) NA_real_)
+}
+
+  n12 <- function(g) {
+  tt <- table(droplevels(factor(g)))
+  vals <- as.integer(tt)
+  if (length(vals) == 1) vals <- c(vals, NA_integer_)
+  names(vals) <- c("n1", "n2")
+  vals
+}
+
+# Selected Wilcoxon comparisons
+# WT (t1+t2) vs FOP (t1+t2), non-ABX only
+nonabx_idx <- df$Type %in% c("CTRL_T1", "CTRL_T2", "FOP_T1", "FOP_T2")
+pool_g <- ifelse(df$Type[nonabx_idx] %in% c("CTRL_T1", "CTRL_T2"), "WT", "FOP")
+
+p_pool_R <- safe_wilcox(df$Richness[nonabx_idx], pool_g)
+p_pool_S <- safe_wilcox(df$Shannon[nonabx_idx],  pool_g)
+n_pool   <- n12(pool_g)
+
+# WT GMA t1 vs WT GMA t2
+wtg_idx <- df$TypePretty %in% c("WT GMA t1", "WT GMA t2")
+p_wtg_R <- safe_wilcox(df$Richness[wtg_idx], df$TypePretty[wtg_idx])
+p_wtg_S <- safe_wilcox(df$Shannon[wtg_idx],  df$TypePretty[wtg_idx])
+n_wtg   <- n12(df$TypePretty[wtg_idx])
+
+# FOP GMA t1 vs FOP GMA t2
+fopg_idx <- df$TypePretty %in% c("FOP GMA t1", "FOP GMA t2")
+p_fopg_R <- safe_wilcox(df$Richness[fopg_idx], df$TypePretty[fopg_idx])
+p_fopg_S <- safe_wilcox(df$Shannon[fopg_idx],  df$TypePretty[fopg_idx])
+n_fopg   <- n12(df$TypePretty[fopg_idx])
+
+# Assemble stats table
+pvals_tbl <- tibble::tibble(
+  Metric     = c("Richness", "Shannon", "Richness", "Shannon", "Richness", "Shannon"),
+  Comparison = c(
+    "WT (t1+t2) vs FOP (t1+t2)",
+    "WT (t1+t2) vs FOP (t1+t2)",
+    "WT GMA t1 vs WT GMA t2",
+    "WT GMA t1 vs WT GMA t2",
+    "FOP GMA t1 vs FOP GMA t2",
+    "FOP GMA t1 vs FOP GMA t2"
+  ),
+  Group1     = c("WT", "WT", "WT GMA t1", "WT GMA t1", "FOP GMA t1", "FOP GMA t1"),
+  Group2     = c("FOP", "FOP", "WT GMA t2", "WT GMA t2", "FOP GMA t2", "FOP GMA t2"),
+  n1         = c(n_pool["n1"], n_pool["n1"], n_wtg["n1"], n_wtg["n1"], n_fopg["n1"], n_fopg["n1"]),
+  n2         = c(n_pool["n2"], n_pool["n2"], n_wtg["n2"], n_wtg["n2"], n_fopg["n2"], n_fopg["n2"]),
+  p_value    = c(p_pool_R, p_pool_S, p_wtg_R, p_wtg_S, p_fopg_R, p_fopg_S)
+) %>%
+  dplyr::mutate(
+    p_value = as.numeric(p_value),
+    p_sig = dplyr::case_when(
+      is.na(p_value)  ~ "NA",
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    ),
+    p_pretty = ifelse(is.na(p_value), "NA", paste0("p = ", signif(p_value, 3)))
+  )
+
+print(pvals_tbl %>% dplyr::select(Metric, Comparison, Group1, Group2, n1, n2, p_pretty, p_sig))
+
+# Sample sizes by displayed group
+n_table <- df %>%
+  dplyr::group_by(TypePretty) %>%
+  dplyr::summarise(
+    n_samples = dplyr::n(),
+    n_mice = dplyr::n_distinct(MouseID),
+    .groups = "drop"
+  )
+
+print(n_table)
+
+# Descriptive statistics by displayed group
+desc_stats <- df %>%
+  dplyr::group_by(TypePretty) %>%
+  dplyr::summarise(
+    n_samples     = dplyr::n(),
+    n_mice        = dplyr::n_distinct(MouseID),
+    richness_mean = mean(Richness, na.rm = TRUE),
+    richness_sd   = sd(Richness, na.rm = TRUE),
+    shannon_mean  = mean(Shannon, na.rm = TRUE),
+    shannon_sd    = sd(Shannon, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(desc_stats)
+
+# Colors
+fill_vals <- c("#F8766D", "#00BFC4", "#7CAE00", "#C77CFF")
+df$Group <- factor(df$Group, levels = c("CTRL", "FOP", "CTRL_ABX", "FOP_ABX"))
+
+# LME calculations
+AD_lme_R <- anova(lmer(Richness ~ as.factor(Type) + (1 | MouseID), data = df))
+AD_lme_S <- anova(lmer(Shannon  ~ as.factor(Type) + (1 | MouseID), data = df))
+
+print(AD_lme_R)
+print(AD_lme_S)
+
+
+# Plot spacing
+maxR <- max(df$Richness, na.rm = TRUE)
+maxS <- max(df$Shannon,  na.rm = TRUE)
+y_pad_R <- maxR * 0.08
+y_pad_S <- maxS * 0.08
+
+# Richness plot
+plot_AD1 <- ggplot(df, aes(x = TypePretty, y = Richness, fill = Group)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA) +
+  geom_point(
+    position = position_jitter(width = 0.15, height = 0),
+    size = 1.6,
+    alpha = 0.6
+  ) +
+  scale_fill_manual(values = fill_vals, name = "Group") +
+  labs(y = "Taxon Richness", x = "") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.3))) +
+  annotate(
+    "text",
+    x = 7.5,
+    y = maxR + 4 * y_pad_R,
+    label = paste("ANOVA (LME)\nP =", signif(AD_lme_R$`Pr(>F)`[1], 3))
+  ) +
+  theme_prism(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin = margin(10, 30, 10, 10)
+  ) +
+  coord_cartesian(clip = "off")
+
+# Shannon plot
+plot_AD2 <- ggplot(df, aes(x = TypePretty, y = Shannon, fill = Group)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA) +
+  geom_point(
+    position = position_jitter(width = 0.15, height = 0),
+    size = 1.6,
+    alpha = 0.6
+  ) +
+  scale_fill_manual(values = fill_vals, name = "Group") +
+  labs(y = "Shannon Diversity Index", x = "") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.3))) +
+  annotate(
+    "text",
+    x = 2.0,
+    y = maxS + 4 * y_pad_S,
+    label = paste("ANOVA (LME)\nP =", signif(AD_lme_S$`Pr(>F)`[1], 3))
+  ) +
+  theme_prism(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin = margin(10, 30, 10, 10)
+  ) +
+  coord_cartesian(clip = "off")
+
+# Combine plots
+plt <- ggpubr::ggarrange(
+  plot_AD1,
+  plot_AD2,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+print(plt)
+
+# Save figure
+ggsave(
+  filename = file.path(fig_dir, "Alpha_Diversity_Boxplots.pdf"),
+  plot = plt,
+  width = 10,
+  height = 6,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Alpha_Diversity_Boxplots.tiff"),
+  plot = plt,
+  width = 10,
+  height = 6,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# Save stats outputs
+write.csv(
+  pvals_tbl,
+  file = file.path(fig_dir, "Alpha_Diversity_Selected_Wilcoxon_Tests.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  n_table,
+  file = file.path(fig_dir, "Alpha_Diversity_Sample_Sizes.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  desc_stats,
+  file = file.path(fig_dir, "Alpha_Diversity_Descriptive_Stats.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(AD_lme_R),
+  file = file.path(fig_dir, "Alpha_Diversity_LME_Richness_ANOVA.csv"),
+  row.names = TRUE
+)
+
+write.csv(
+  as.data.frame(AD_lme_S),
+  file = file.path(fig_dir, "Alpha_Diversity_LME_Shannon_ANOVA.csv"),
+  row.names = TRUE
+)
+```
+
+### Beta Diversity via Bray-Curtis PCoA
+To determine the differences in microbial community composition between groups, we will calculate the Bray-Curtis dissimilarity and perform Principal Coordinates Analysis (PCoA). We will visualize the results using scatter plots and assess statistical significance using PERMANOVA.
+
+#### WT compared to FOP Mice after GMA 
+Here we are comparing the Bray-Curtis PCoA of WT and FOP mice after GMA treatment.
+
+Once we have calculated the Bray-Curtis PCoA, we need to isolate the first two axes and add them to the sample metadata for plotting. 
+
+```{r Plotting, echo = TRUE, message=FALSE, fig.width=8, fig.height=6}
+# Prepare metadata
+sdf <- data.frame(sample_data(ps_vst), check.names = FALSE)
+
+# Infer timepoint if missing
+if (!"Timepoint" %in% names(sdf)) {
+  tp_from_name <- sub(".*_T([12]).*", "T\\1", rownames(sdf))
+  tp_from_name[!grepl("_T[12]", rownames(sdf))] <- NA
+  sdf$Timepoint <- tp_from_name
+}
+sdf$Timepoint <- factor(sdf$Timepoint, levels = c("T1", "T2"))
+
+# Pretty labels
+sdf$Type <- as.character(sdf$Type)
+sdf$TypePretty <- dplyr::recode(
+  sdf$Type,
+  "CTRL_T1"     = "WT t1",
+  "CTRL_T2"     = "WT t2",
+  "FOP_T1"      = "FOP t1",
+  "FOP_T2"      = "FOP t2",
+  "CTRL_ABX_T1" = "WT GMA t1",
+  "CTRL_ABX_T2" = "WT GMA t2",
+  "FOP_ABX_T1"  = "FOP GMA t1",
+  "FOP_ABX_T2"  = "FOP GMA t2"
+)
+
+sdf$TypePretty <- factor(
+  sdf$TypePretty,
+  levels = c(
+    "WT t1", "WT t2",
+    "FOP t1", "FOP t2",
+    "WT GMA t1", "WT GMA t2",
+    "FOP GMA t1", "FOP GMA t2"
+  )
+)
+
+# 4-color plotting groups
+sdf$GroupPlot <- dplyr::case_when(
+  sdf$Type %in% c("CTRL_T1", "CTRL_T2") ~ "WT",
+  sdf$Type %in% c("FOP_T1", "FOP_T2") ~ "FOP",
+  sdf$Type %in% c("CTRL_ABX_T1", "CTRL_ABX_T2") ~ "WT GMA",
+  sdf$Type %in% c("FOP_ABX_T1", "FOP_ABX_T2") ~ "FOP GMA",
+  TRUE ~ NA_character_
+)
+
+sdf$GroupPlot <- factor(
+  sdf$GroupPlot,
+  levels = c("WT GMA", "WT", "FOP", "FOP GMA")
+)
+
+# Before / After GMA grouping
+sdf$GMATiming <- dplyr::case_when(
+  sdf$Type %in% c("CTRL_ABX_T2", "FOP_ABX_T2") ~ "After GMA",
+  sdf$Type %in% c(
+    "CTRL_T1", "CTRL_T2",
+    "FOP_T1", "FOP_T2",
+    "CTRL_ABX_T1", "FOP_ABX_T1"
+  ) ~ "Before GMA",
+  TRUE ~ NA_character_
+)
+
+sdf$GMATiming <- factor(
+  sdf$GMATiming,
+  levels = c("Before GMA", "After GMA")
+)
+
+# WT ellipse
+sdf$WTEllipse <- ifelse(
+  sdf$Type %in% c("CTRL_T1", "CTRL_T2", "CTRL_ABX_T1"),
+  "WT ellipse",
+  NA
+)
+
+# FOP ellipse
+sdf$FOPEllipse <- ifelse(
+  sdf$Type %in% c("FOP_T1", "FOP_T2", "FOP_ABX_T1"),
+  "FOP ellipse",
+  NA
+)
+
+sample_data(ps_vst) <- sample_data(sdf)
+
+# Subset to desired groups
+phy_plot <- subset_samples(
+  ps_vst,
+  Type %in% c(
+    "CTRL_T1", "CTRL_T2",
+    "FOP_T1", "FOP_T2",
+    "CTRL_ABX_T1", "CTRL_ABX_T2",
+    "FOP_ABX_T1", "FOP_ABX_T2"
+  )
+)
+
+# Bray-Curtis PCoA
+pcoa_bray <- ordinate(
+  phy_plot,
+  method = "PCoA",
+  distance = "bray"
+)
+
+scores_df <- as.data.frame(
+  pcoa_bray$vectors[, 1:2, drop = FALSE]
+)
+
+colnames(scores_df) <- c("Axis.1", "Axis.2")
+scores_df$SampleID <- rownames(scores_df)
+
+plot_meta <- data.frame(
+  sample_data(phy_plot),
+  check.names = FALSE
+)
+
+plot_meta$SampleID <- rownames(plot_meta)
+
+plot_df <- dplyr::left_join(
+  scores_df,
+  plot_meta,
+  by = "SampleID"
+)
+
+pc1_var <- if (!is.null(pcoa_bray$values$Relative_eig)) {
+  round(100 * pcoa_bray$values$Relative_eig[1], 1)
+} else { NA }
+
+pc2_var <- if (!is.null(pcoa_bray$values$Relative_eig)) {
+  round(100 * pcoa_bray$values$Relative_eig[2], 1)
+} else { NA }
+
+# Report
+cat("\n================ BETA DIVERSITY REPORT ================\n")
+cat("Distance metric: Bray-Curtis\n")
+cat("Ordination: PCoA\n")
+cat("All samples retained (no manual outlier removal).\n")
+cat("=======================================================\n\n")
+
+plot_n_table <- data.frame(sample_data(phy_plot), check.names = FALSE) %>%
+  dplyr::group_by(TypePretty, GroupPlot, GMATiming) %>%
+  dplyr::summarise(
+    n_samples = dplyr::n(),
+    n_mice = dplyr::n_distinct(MouseID),
+    .groups = "drop"
+  )
+
+print(plot_n_table)
+
+# Aesthetics
+color_map <- c(
+  "WT GMA"  = "#20C4C9",
+  "WT"      = "#F8766D",
+  "FOP"     = "#7CAE00",
+  "FOP GMA" = "#B276E8"
+)
+
+shape_map <- c(
+  "Before GMA" = 16,
+  "After GMA"  = 17
+)
+
+xr <- range(plot_df$Axis.1, na.rm = TRUE)
+yr <- range(plot_df$Axis.2, na.rm = TRUE)
+
+# Plot
+plot_bray <- ggplot(plot_df, aes(x = Axis.1, y = Axis.2)) +
+
+  geom_point(
+    aes(color = GroupPlot, shape = GMATiming),
+    size = 6
+  ) +
+
+  stat_ellipse(
+    data = subset(plot_df, !is.na(WTEllipse)),
+    aes(group = WTEllipse),
+    type = "t",
+    linewidth = 2.2,
+    color = "#F8766D",
+    linetype = "dashed"
+  ) +
+
+  stat_ellipse(
+    data = subset(plot_df, !is.na(FOPEllipse)),
+    aes(group = FOPEllipse),
+    type = "t",
+    linewidth = 2.2,
+    color = "#7CAE00",
+    linetype = "dashed"
+  ) +
+
+  stat_ellipse(
+    data = subset(plot_df, GMATiming == "Before GMA"),
+    aes(group = GMATiming),
+    type = "t",
+    linewidth = 2.2,
+    color = "black",
+    linetype = "solid"
+  ) +
+
+  stat_ellipse(
+    data = subset(plot_df, GMATiming == "After GMA"),
+    aes(group = GMATiming),
+    type = "t",
+    linewidth = 2.2,
+    color = "black",
+    linetype = "dashed"
+  ) +
+
+  scale_color_manual(values = color_map, name = "Group") +
+  scale_shape_manual(values = shape_map, guide = "none") +
+
+  labs(
+    x = paste0("Principal Coordinate 1 (", pc1_var, "%)"),
+    y = paste0("Principal Coordinate 2 (", pc2_var, "%)")
+  ) +
+
+  annotate(
+    "text",
+    x = xr[2] - 0.01 * diff(xr),
+    y = yr[2] - 0.01 * diff(yr),
+    label = "Before GMA",
+    hjust = 1,
+    vjust = 1,
+    size = 10
+  ) +
+
+  annotate(
+    "text",
+    x = xr[1] + 0.03 * diff(xr),
+    y = yr[1] + 0.35 * diff(yr),
+    label = "After GMA",
+    hjust = 0,
+    vjust = 0,
+    size = 10
+  ) +
+
+  theme_bw(base_size = 20) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 3),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title.x = element_text(size = 28),
+    axis.title.y = element_text(size = 28),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 17),
+    legend.position = c(0.12, 0.18),
+    legend.justification = c(0, 0),
+    legend.background = element_blank(),
+    legend.key = element_blank()
+  )
+
+print(plot_bray)
+
+# Save outputs
+ggsave(
+  file.path(fig_dir, "BrayCurtis_PCoA_WT_FOP_GMA.pdf"),
+  plot = plot_bray,
+  width = 8,
+  height = 6,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "BrayCurtis_PCoA_WT_FOP_GMA.tiff"),
+  plot = plot_bray,
+  width = 8,
+  height = 6,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+write.csv(
+  plot_n_table,
+  file.path(fig_dir, "BrayCurtis_PCoA_Group_Sample_Sizes.csv"),
+  row.names = FALSE
+)
+```
+
+```{r PERMANOVA P Values, echo=TRUE, message=FALSE, fig.width=8, fig.height=6}
+# Helper 
+perm_test <- function(phy, dist_method = "bray", rhs, title) {
+  set.seed(123)
+
+  d  <- phyloseq::distance(phy, method = dist_method)
+  md <- as(sample_data(phy), "data.frame")
+
+  form <- stats::as.formula(paste("d ~", rhs))
+  res  <- vegan::adonis2(form, data = md)
+
+  cat(sprintf(
+    "%s (%s): F=%0.5f, R^2=%0.5f, p=%s\n",
+    title,
+    dist_method,
+    res$F[1],
+    res$R2[1],
+    signif(res$`Pr(>F)`[1], 3)
+  ))
+
+  invisible(res)
+}
+# bray-curtis PERMANOVA
+# CTRL_T1 vs FOP_T1
+phy_ct1_ft1 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c("CTRL_T1","FOP_T1"),
+  ps_vst
+)
+perm_test(phy_ct1_ft1, "bray", "Type", "CTRL_T1 vs FOP_T1")
+
+# CTRL_T1 vs CTRL_ABX_T1
+phy_ct1_cabt1 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c("CTRL_T1","CTRL_ABX_T1"),
+  ps_vst
+)
+perm_test(phy_ct1_cabt1, "bray", "Type", "CTRL_T1 vs CTRL_ABX_T1")
+
+# FOP_T1 vs FOP_ABX_T1
+phy_ft1_fabt1 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c("FOP_T1","FOP_ABX_T1"),
+  ps_vst
+)
+perm_test(phy_ft1_fabt1, "bray", "Type", "FOP_T1 vs FOP_ABX_T1")
+
+# CTRL_T2 vs CTRL_ABX_T2
+phy_ct2_cabt2 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c("CTRL_T2","CTRL_ABX_T2"),
+  ps_vst
+)
+perm_test(phy_ct2_cabt2, "bray", "Type", "CTRL_T2 vs CTRL_ABX_T2")
+
+# FOP_T2 vs FOP_ABX_T2
+phy_ft2_fabt2 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c("FOP_T2","FOP_ABX_T2"),
+  ps_vst
+)
+perm_test(phy_ft2_fabt2, "bray", "Type", "FOP_T2 vs FOP_ABX_T2")
+
+# CTRL_T1 + CTRL_ABX_T1 vs FOP_T1 + FOP_ABX_T1
+phy_cabt1_fabt1 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c(
+    "CTRL_T1","CTRL_ABX_T1",
+    "FOP_T1","FOP_ABX_T1"
+  ),
+  ps_vst
+)
+perm_test(
+  phy_cabt1_fabt1,
+  "bray",
+  "Group2",
+  "CTRL_T1+CTRL_ABX_T1 vs FOP_T1+FOP_ABX_T1"
+)
+
+# CTRL_T1 + CTRL_T2 + CTRL_ABX_T1 vs FOP_T1 + FOP_T2 + FOP_ABX_T1
+phy_cabt1_fabt1 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c(
+    "CTRL_T1","CTRL_T2","CTRL_ABX_T1",
+    "FOP_T1","FOP_T2","FOP_ABX_T1"
+  ),
+  ps_vst
+)
+perm_test(
+  phy_cabt1_fabt1,
+  "bray",
+  "Group2",
+  "CTRL_T1+CTRL_T2+CTRL_ABX_T1 vs FOP_T1+FOP_T2+FOP_ABX_T1"
+)
+```
+
+# Relative Abundance Plots
+Here we will create stacked bar plots to visualize the relative abundance of taxa at different taxonomic levels (Kingdom, Phylum, Class) across the experimental groups.
+
+```{r Taxonomic Bar Plots, echo=TRUE, message=FALSE}
+# Helper function for stacked barplots
+plot_taxa_bar <- function(ps_obj, taxrank, outfile, facet_levels, y_break = NULL, save = TRUE) {
+    
+    # Validate object
+    if (!inherits(ps_obj, "phyloseq")) stop("ps_obj must be a phyloseq object.")
+    if (!taxrank %in% rank_names(ps_obj)) {
+        stop(paste("Tax rank", taxrank, "not found in object. Available ranks:",
+                   paste(rank_names(ps_obj), collapse = ", ")))
+    }
+    
+    # Remove taxa with zero counts
+    ps_obj <- prune_taxa(taxa_sums(ps_obj) > 0, ps_obj)
+    
+    # Agglomerate to desired rank
+    agg <- tax_glom(ps_obj, taxrank = taxrank)
+    
+    # Transform to relative abundance
+    rel <- transform_sample_counts(agg, function(x) x / sum(x))
+    
+    # Build plot
+    p <- plot_bar(rel, fill = taxrank) +
+    geom_bar(aes_string(color = taxrank, fill = taxrank),
+             stat = "identity", position = "stack") +
+    xlab("") +
+    ylab("Relative Abundance (%)") +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    facet_grid(~factor(Type, levels = facet_levels), scales = "free_x", space = "free_x") +
+    theme_bw(base_size = 14) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 10),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        legend.text = element_text(face = "italic", size = 10),
+        legend.title = element_text(face = "bold", size = 11),
+        strip.text.x = element_text(size = 11, face = "bold")
+    )
+    
+    # Save figure
+    if (save)
+        ggsave(filename = outfile, plot = p, width = 12, height = 5, dpi = 300)
+    
+    return(p)
+}
+
+# Facet order (experimental groups)
+facet_levels <- c(
+    "CTRL_T1", "CTRL_T2",
+    "FOP_T1", "FOP_T2",
+    "CTRL_ABX_T1", "CTRL_ABX_T2",
+    "FOP_ABX_T1", "FOP_ABX_T2"
+)
+```
+
+## Generate and Save Taxonomic Bar Plots
+Here we will generate stacked bar plots showing the relative abundance of taxa at the Kingdom and Phylum levels across different experimental groups.
+
+```{r Generating Taxonomic Bar Plots, echo=TRUE, message=FALSE, fig.width=12, fig.height=5}
+# Generate plots
+
+library(scales)
+
+ps_vst <- ps
+ps_deseq2 <- phyloseq_to_deseq2(ps_vst, ~1)
+ps_deseq2_norm <- estimateSizeFactors(ps_deseq2, type = "poscounts")
+otu_table(ps_vst) <- otu_table(counts(ps_deseq2_norm, normalized = TRUE), taxa_are_rows = TRUE)
+
+domain_plot <- plot_taxa_bar(
+    ps_obj = ps_vst,
+    taxrank = "Kingdom",
+    outfile = "Figures/FOP-Kraken-taxonomy_domain_level_barplot.pdf",
+    facet_levels = facet_levels,
+    save = FALSE
+)
+
+phylum_plot <- plot_taxa_bar(
+    ps_obj = ps_vst,
+    taxrank = "Phylum",
+    outfile = "Figures/FOP-Kraken-taxonomy_phylum_level_barplot.pdf",
+    facet_levels = facet_levels,
+    save = FALSE
+)
+
+class_plot <- plot_taxa_bar(
+    ps_obj = ps_vst,
+    taxrank = "Class",
+    outfile = "Figures/FOP-Kraken-taxonomy_class_level_barplot.pdf",
+    facet_levels = facet_levels,
+    save = FALSE
+)
+
+# Display
+domain_plot
+phylum_plot
+class_plot
+```
+
+```{r Taxonomic Bar Plots for paper, echo=TRUE, message=FALSE}
+# Helper function for stacked barplots
+plot_taxa_bar <- function(ps_obj, taxrank, facet_levels) {
+
+  if (!inherits(ps_obj, "phyloseq")) {
+    stop("ps_obj must be a phyloseq object.")
+  }
+
+  if (!taxrank %in% rank_names(ps_obj)) {
+    stop(
+      paste(
+        "Tax rank", taxrank,
+        "not found in object. Available ranks:",
+        paste(rank_names(ps_obj), collapse = ", ")
+      )
+    )
+  }
+
+  # Remove taxa with zero counts
+  ps_obj <- prune_taxa(
+    taxa_sums(ps_obj) > 0,
+    ps_obj
+  )
+
+  # Agglomerate to desired rank
+  agg <- tax_glom(
+    ps_obj,
+    taxrank = taxrank
+  )
+
+  # Relative abundance
+  rel <- transform_sample_counts(
+    agg,
+    function(x) x / sum(x)
+  )
+
+  # Plot
+  p <- plot_bar(rel, fill = taxrank) +
+    geom_bar(
+      aes_string(color = taxrank, fill = taxrank),
+      stat = "identity",
+      position = "stack"
+    ) +
+    xlab("") +
+    ylab("Relative Abundance (%)") +
+    scale_y_continuous(
+      labels = percent_format(accuracy = 1)
+    ) +
+    facet_grid(
+      ~ factor(Type, levels = facet_levels),
+      scales = "free_x",
+      space = "free_x"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      axis.text.x = element_text(
+        angle = 60,
+        hjust = 1,
+        vjust = 1,
+        size = 11
+      ),
+      axis.title.y = element_text(
+        size = 14,
+        face = "bold"
+      ),
+      legend.text = element_text(
+        face = "italic",
+        size = 10
+      ),
+      legend.title = element_text(
+        face = "bold",
+        size = 11
+      ),
+      strip.text.x = element_text(
+        size = 12,
+        face = "bold"
+      )
+    )
+
+  return(p)
+}
+
+# Facet order
+facet_levels <- c(
+  "WT_T1", "WT_T2",
+  "FOP_T1", "FOP_T2",
+  "WT_GMA_T1", "WT_GMA_T2",
+  "FOP_GMA_T1", "FOP_GMA_T2"
+)
+
+# Normalize + relabel
+ps_vst <- ps
+
+ps_deseq2 <- phyloseq_to_deseq2(
+  ps_vst,
+  ~1
+)
+
+ps_deseq2_norm <- estimateSizeFactors(
+  ps_deseq2,
+  type = "poscounts"
+)
+
+otu_table(ps_vst) <- otu_table(
+  counts(ps_deseq2_norm, normalized = TRUE),
+  taxa_are_rows = TRUE
+)
+
+# Fix sample names
+sn <- sample_names(ps_vst)
+
+sn <- gsub("^CTRL_", "WT_", sn)
+sn <- gsub("Abx", "GMA", sn)
+
+sample_names(ps_vst) <- sn
+
+# Fix metadata labels
+sd <- data.frame(sample_data(ps_vst))
+
+sd$Type <- as.character(sd$Type)
+sd$Type <- gsub("CTRL_ABX", "WT_GMA", sd$Type)
+sd$Type <- gsub("FOP_ABX", "FOP_GMA", sd$Type)
+sd$Type <- gsub("CTRL", "WT", sd$Type)
+
+sample_data(ps_vst) <- sample_data(sd)
+
+# Generate plots
+domain_plot <- plot_taxa_bar(
+  ps_obj = ps_vst,
+  taxrank = "Kingdom",
+  facet_levels = facet_levels
+)
+
+phylum_plot <- plot_taxa_bar(
+  ps_obj = ps_vst,
+  taxrank = "Phylum",
+  facet_levels = facet_levels
+)
+
+class_plot <- plot_taxa_bar(
+  ps_obj = ps_vst,
+  taxrank = "Class",
+  facet_levels = facet_levels
+)
+
+# Show in Rmd
+domain_plot
+phylum_plot
+class_plot
+
+# Save to Figures folder
+
+# DOMAIN
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "FOP-Kraken-taxonomy_domain_level_barplot.pdf"
+  ),
+  plot = domain_plot,
+  width = 16,
+  height = 7,
+  units = "in",
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "FOP-Kraken-taxonomy_domain_level_barplot.tiff"
+  ),
+  plot = domain_plot,
+  width = 16,
+  height = 7,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# PHYLUM
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "FOP-Kraken-taxonomy_phylum_level_barplot.pdf"
+  ),
+  plot = phylum_plot,
+  width = 20,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "FOP-Kraken-taxonomy_phylum_level_barplot.tiff"
+  ),
+  plot = phylum_plot,
+  width = 20,
+  height = 8,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# CLASS
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "FOP-Kraken-taxonomy_class_level_barplot.pdf"
+  ),
+  plot = class_plot,
+  width = 20,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "FOP-Kraken-taxonomy_class_level_barplot.tiff"
+  ),
+  plot = class_plot,
+  width = 20,
+  height = 8,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+```{r Revert WT_GMA_to_CTRL_ABX, echo=TRUE, message=FALSE}
+# This assumes ps_vst currently has WT / WT_GMA / FOP_GMA names
+# and you want to go back to CTRL / CTRL_ABX / FOP_ABX
+
+# 1) Revert sample names
+sn <- sample_names(ps_vst)
+
+# Do the more specific patterns first, then the general ones
+sn <- gsub("WT_GMA_",  "CTRL_ABX_", sn)
+sn <- gsub("FOP_GMA_", "FOP_ABX_",  sn)
+sn <- gsub("^WT_",     "CTRL_",     sn)
+
+sample_names(ps_vst) <- sn
+
+# (Optional) also revert ps if you think you changed it earlier
+# sn_ps <- sample_names(ps)
+# sn_ps <- gsub("WT_GMA_",  "CTRL_ABX_", sn_ps)
+# sn_ps <- gsub("FOP_GMA_", "FOP_ABX_",  sn_ps)
+# sn_ps <- gsub("^WT_",     "CTRL_",     sn_ps)
+# sample_names(ps) <- sn_ps
+
+# 2) Revert Type metadata (facet / group labels)
+sd <- data.frame(sample_data(ps_vst))
+
+sd$Type <- as.character(sd$Type)
+
+# Specific patterns first
+sd$Type <- gsub("WT_GMA_T1",  "CTRL_ABX_T1", sd$Type)
+sd$Type <- gsub("WT_GMA_T2",  "CTRL_ABX_T2", sd$Type)
+sd$Type <- gsub("FOP_GMA_T1", "FOP_ABX_T1",  sd$Type)
+sd$Type <- gsub("FOP_GMA_T2", "FOP_ABX_T2",  sd$Type)
+
+# Then the baseline ones
+sd$Type <- gsub("WT_T1", "CTRL_T1", sd$Type)
+sd$Type <- gsub("WT_T2", "CTRL_T2", sd$Type)
+
+sample_data(ps_vst) <- sample_data(sd)
+
+# Quick sanity check
+table(sample_data(ps_vst)$Type)
+```
+
+
+# Differential Abundance Analysis
+Here we will perform differential abundance analysis at the phylum level using DESeq2, comparing the combined FOP groups (FOP_ABX_T1, FOP_T1, FOP_T2) against the combined CTRL groups (CTRL_ABX_T1, CTRL_T1, CTRL_T2). We will also create a volcano plot to visualize the results.
+
+## Phylum-Level Differential Abundance and Volcano Plot
+We first want to prepare the data for DESeq2 analysis by constructing a phylum-level count matrix from phyloseq object. Then, we will perform the differential abundance analysis and create a volcano plot to visualize significant changes. In specific, we will be comparing the FOP groups (FOP_ABX_T1, FOP_T1, FOP_T2) against the CTRL groups (CTRL_ABX_T1, CTRL_T1, CTRL_T2), both without antibiotic treatment.
+
+```{r Dataset Preparation all FOP vs CTRL for DESeq2, echo=TRUE, message=FALSE}
+ps_filtered <- prune_samples(sample_data(ps_vst)$Type %in% c("CTRL_ABX_T1", "CTRL_T1", "CTRL_T2","FOP_ABX_T1",  "FOP_T1",  "FOP_T2"), ps_vst)
+
+# Filter taxa present in over 30% of the samples
+ps_filtered <- filter_taxa(ps_filtered, function(x) sum(x > 0) > (0.3*length(x)), TRUE)
+
+# Convert to factor
+sample_data(ps_filtered)$Type <- factor(sample_data(ps_filtered)$Type)
+
+sample_data(ps_filtered)$Group <- factor(sample_data(ps_filtered)$Group)
+
+# Convert to DESeq2 object
+phy_deseq <- phyloseq_to_deseq2(ps_filtered, ~ Group)
+```
+
+```{r Differential Expression Analysis all FOP vs CTRL, echo=TRUE, message=FALSE, fig.width=8, fig.height=6}
+# --- Run DESeq2 analysis ---
+phy_deseq_1 <- DESeq(phy_deseq, fitType = "local", sfType = "poscounts")
+
+# Extract results for the specified comparison
+phy_deseq_1_res <- results(phy_deseq_1,
+                           name = "Group_FOP_vs_CTRL",
+                           pAdjustMethod = "fdr")
+
+# Convert to data frame and preserve OTU/ASV names
+phy_deseq_1_res_df <- as.data.frame(phy_deseq_1_res) %>%
+  tibble::rownames_to_column("FeatureID")
+
+# Extract taxonomy table and prepare for merge
+tax_df <- as.data.frame(tax_table(ps_filtered)) %>%
+  tibble::rownames_to_column("FeatureID")
+
+# Merge DESeq2 results with taxonomy information
+phy_deseq_1_res_cft1 <- dplyr::inner_join(phy_deseq_1_res_df, tax_df, by = "FeatureID")
+
+# Replace NA adjusted p-values with 1 (non-significant)
+phy_deseq_1_res_cft1$padj[is.na(phy_deseq_1_res_cft1$padj)] <- 1
+
+# Subset to significant features (padj < 0.05)
+phy_deseq_1_res_cft1_sig <- dplyr::filter(phy_deseq_1_res_cft1, padj < 0.05)
+
+# Sanity check
+print("Significant features: ", nrow(phy_deseq_1_res_cft1_sig))
+```
+
+```{r Volcano Plot all FOP vs CTRL, echo=TRUE, message=FALSE, fig.width=8, fig.height=6}
+# Create Figures folder
+fig_dir <- "Figures"
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE)
+}
+
+# Volcano plot
+df <- phy_deseq_1_res_cft1
+
+# Stabilize padj and compute -log10
+eps <- .Machine$double.xmin
+df$padj_fix <- ifelse(is.na(df$padj) | df$padj <= 0, eps, df$padj)
+df$neglog10_padj <- -log10(df$padj_fix)
+
+# Axis caps to reduce compression from extreme outliers
+y_cap <- max(stats::quantile(df$neglog10_padj, 0.99, na.rm = TRUE), 8)
+x_cap <- max(stats::quantile(abs(df$log2FoldChange), 0.99, na.rm = TRUE), 3)
+
+vp1 <- ggplot(df, aes(x = log2FoldChange, y = neglog10_padj)) +
+  geom_point(color = "grey70", alpha = 0.75, size = 2.5) +
+  geom_point(
+    data = subset(df, padj_fix < 0.05),
+    aes(color = Phylum),
+    size = 2.8
+  ) +
+  geom_vline(xintercept = 0, color = "grey40", linetype = "dashed", linewidth = 0.7) +
+  geom_hline(yintercept = -log10(0.05), color = "red", linetype = "dashed", linewidth = 0.7) +
+  labs(
+    title = "Differential Abundance Volcano Plot",
+    x = expression("Log"[2] * " Fold Change (FOP vs CTRL)"),
+    y = expression("-Log"[10] * "(p-value)"),
+    color = "Phylum"
+  ) +
+  coord_cartesian(xlim = c(-x_cap, x_cap), ylim = c(0, y_cap)) +
+  theme_prism(base_size = 16, border = TRUE) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14),
+    legend.text      = element_text(face = "italic", size = 12),
+    plot.title       = element_text(face = "bold", hjust = 0.5),
+    axis.title.x     = element_text(face = "bold"),
+    axis.title.y     = element_text(face = "bold")
+  )
+
+print(vp1)
+
+# Save figure
+ggsave(
+  filename = file.path(fig_dir, "Volcano_FOP_vs_CTRL_T1_T2_ABXT1.pdf"),
+  plot = vp1,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Volcano_FOP_vs_CTRL_T1_T2_ABXT1.tiff"),
+  plot = vp1,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+```{r Dataset Preparation FOP_ABX_T2_vs_FOP_Pool, echo=TRUE, message=FALSE}
+# Keep only FOP-related groups (T1, T2, ABX_T1, ABX_T2)
+ps_fop_abx2 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c("FOP_T1", "FOP_T2", "FOP_ABX_T1", "FOP_ABX_T2"),
+  ps_vst
+)
+
+# Filter taxa present in >30% of samples
+ps_fop_abx2 <- filter_taxa(
+  ps_fop_abx2,
+  function(x) sum(x > 0) > (0.3 * length(x)),
+  prune = TRUE
+)
+
+# Define comparison factor:
+#   - "FOP_POOL" = FOP_T1, FOP_T2, FOP_ABX_T1
+#   - "FOP_ABX_T2" = FOP_ABX_T2 (comparison group)
+grp <- ifelse(
+  sample_data(ps_fop_abx2)$Type == "FOP_ABX_T2",
+  "FOP_ABX_T2",
+  "FOP_POOL"
+)
+
+sample_data(ps_fop_abx2)$GroupFOPAbx2 <- factor(
+  grp,
+  levels = c("FOP_POOL", "FOP_ABX_T2")  # FOP_POOL as reference
+)
+
+# Build DESeq2 object
+dds_fop_abx2 <- phyloseq_to_deseq2(ps_fop_abx2, ~ GroupFOPAbx2)
+```
+
+```{r Differential Expression FOP_ABX_T2_vs_FOP_Pool, echo=TRUE, message=FALSE}
+dds_fop_abx2 <- DESeq(dds_fop_abx2, fitType = "local", sfType = "poscounts")
+
+# Contrast: FOP_ABX_T2 vs FOP_POOL (log2FC > 0 => higher in FOP_ABX_T2)
+res_fop_abx2 <- results(
+  dds_fop_abx2,
+  contrast = c("GroupFOPAbx2", "FOP_ABX_T2", "FOP_POOL"),
+  pAdjustMethod = "fdr"
+)
+
+# Preserve feature IDs
+res_fop_abx2_df <- as.data.frame(res_fop_abx2) %>%
+  tibble::rownames_to_column("FeatureID")
+
+# Bring in taxonomy
+tax_fop_abx2 <- as.data.frame(tax_table(ps_fop_abx2)) %>%
+  tibble::rownames_to_column("FeatureID")
+
+# Merge results + taxonomy
+res_fop_abx2_merged <- dplyr::inner_join(res_fop_abx2_df, tax_fop_abx2, by = "FeatureID")
+
+# Replace NA padj with 1 (non-significant)
+res_fop_abx2_merged$padj[is.na(res_fop_abx2_merged$padj)] <- 1
+
+message(sprintf("Significant features (padj < 0.05): %d",
+                sum(res_fop_abx2_merged$padj < 0.05, na.rm = TRUE)))
+```
+
+```{r Volcano Plot FOP_ABX_T2_vs_FOP_Pool, echo=TRUE, message=FALSE, fig.width=8, fig.height=6}
+# Volcano plot
+vp_fop_abx2 <- ggplot(
+  res_fop_abx2_merged,
+  aes(x = log2FoldChange, y = -log10(padj))
+) +
+
+  # All points
+  geom_point(
+    color = "grey70",
+    alpha = 0.7,
+    size = 3
+  ) +
+
+  # Significant points
+  {
+    if ("Phylum" %in% names(res_fop_abx2_merged)) {
+      geom_point(
+        data = subset(res_fop_abx2_merged, padj < 0.05),
+        aes(color = Phylum),
+        size = 3
+      )
+    } else {
+      geom_point(
+        data = subset(res_fop_abx2_merged, padj < 0.05),
+        color = "black",
+        size = 3
+      )
+    }
+  } +
+
+  # Threshold lines
+  geom_vline(
+    xintercept = 0,
+    color = "grey40",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+
+  geom_hline(
+    yintercept = -log10(0.05),
+    color = "red",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+
+  # Labels
+  labs(
+    title = "Differential Abundance: FOP_ABX_T2 vs FOP Pool (T1 + T2 + ABX_T1)",
+    x = expression("Log"[2] * " Fold Change (FOP_ABX_T2 vs FOP pool)"),
+    y = expression("-Log"[10] * "(adj. p-value)"),
+    color = "Phylum"
+  ) +
+
+  theme_prism(base_size = 16, border = TRUE) +
+
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 14),
+    legend.text = element_text(face = "italic", size = 12),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold")
+  )
+
+print(vp_fop_abx2)
+
+# Save to Figures folder
+fig_dir <- "Figures"
+
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE)
+}
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "Volcano_FOP_ABX_T2_vs_FOP_Pool.pdf"
+  ),
+  plot = vp_fop_abx2,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "Volcano_FOP_ABX_T2_vs_FOP_Pool.tiff"
+  ),
+  plot = vp_fop_abx2,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+```{r Dataset Preparation CTRL_ABX_T2_vs_CTRL_Pool, echo=TRUE, message=FALSE}
+# Keep only the CTRL-related groups
+ps_ctrl_abx2 <- prune_samples(
+  sample_data(ps_vst)$Type %in% c("CTRL_T1", "CTRL_T2", "CTRL_ABX_T1", "CTRL_ABX_T2"),
+  ps_vst
+)
+
+# Filter taxa present in >30% of samples
+ps_ctrl_abx2 <- filter_taxa(
+  ps_ctrl_abx2,
+  function(x) sum(x > 0) > (0.3 * length(x)),
+  prune = TRUE
+)
+
+# Define comparison factor: CTRL_POOL = T1 + T2 + ABX_T1, comparison = ABX_T2
+grp <- ifelse(
+  sample_data(ps_ctrl_abx2)$Type == "CTRL_ABX_T2",
+  "CTRL_ABX_T2",
+  "CTRL_POOL"
+)
+
+sample_data(ps_ctrl_abx2)$GroupCTRLAbx2 <- factor(
+  grp,
+  levels = c("CTRL_POOL", "CTRL_ABX_T2") # CTRL_POOL is reference
+)
+
+# Build DESeq2 object
+dds_ctrl_abx2 <- phyloseq_to_deseq2(ps_ctrl_abx2, ~ GroupCTRLAbx2)
+```
+
+```{r Differential Expression CTRL_ABX_T2_vs_CTRL_Pool, echo=TRUE, message=FALSE}
+dds_ctrl_abx2 <- DESeq(dds_ctrl_abx2, fitType = "local", sfType = "poscounts")
+
+# Contrast: CTRL_ABX_T2 vs CTRL_POOL
+res_ctrl_abx2 <- results(
+  dds_ctrl_abx2,
+  contrast = c("GroupCTRLAbx2", "CTRL_ABX_T2", "CTRL_POOL"),
+  pAdjustMethod = "fdr"
+)
+
+# Preserve feature IDs
+res_ctrl_abx2_df <- as.data.frame(res_ctrl_abx2) %>%
+  tibble::rownames_to_column("FeatureID")
+
+# Bring in taxonomy
+tax_ctrl_abx2 <- as.data.frame(tax_table(ps_ctrl_abx2)) %>%
+  tibble::rownames_to_column("FeatureID")
+
+# Merge results + taxonomy
+res_ctrl_abx2_merged <- dplyr::inner_join(res_ctrl_abx2_df, tax_ctrl_abx2, by = "FeatureID")
+
+# Replace NA padj with 1 (non-significant)
+res_ctrl_abx2_merged$padj[is.na(res_ctrl_abx2_merged$padj)] <- 1
+
+message(sprintf(
+  "Significant features (padj < 0.05): %d",
+  sum(res_ctrl_abx2_merged$padj < 0.05, na.rm = TRUE)
+))
+```
+
+```{r Volcano Plot CTRL_ABX_T2_vs_CTRL_Pool, echo=TRUE, message=FALSE, fig.width=8, fig.height=6}
+vp_ctrl_abx2 <- ggplot(
+  res_ctrl_abx2_merged,
+  aes(x = log2FoldChange, y = -log10(padj))
+) +
+
+  # All points
+  geom_point(
+    color = "grey70",
+    alpha = 0.7,
+    size = 3
+  ) +
+
+  # Significant points colored by Phylum
+  {
+    if ("Phylum" %in% names(res_ctrl_abx2_merged)) {
+      geom_point(
+        data = subset(res_ctrl_abx2_merged, padj < 0.05),
+        aes(color = Phylum),
+        size = 3
+      )
+    } else {
+      geom_point(
+        data = subset(res_ctrl_abx2_merged, padj < 0.05),
+        color = "black",
+        size = 3
+      )
+    }
+  } +
+
+  # Threshold lines
+  geom_vline(
+    xintercept = 0,
+    color = "grey40",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+
+  geom_hline(
+    yintercept = -log10(0.05),
+    color = "red",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+
+  # Labels
+  labs(
+    title = "Differential Abundance: CTRL_ABX_T2 vs CTRL Pool (T1 + T2 + ABX_T1)",
+    x = expression("Log"[2] * " Fold Change (CTRL_ABX_T2 vs CTRL pool)"),
+    y = expression("-Log"[10] * "(adj. p-value)"),
+    color = "Phylum"
+  ) +
+
+  theme_prism(base_size = 16, border = TRUE) +
+
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 14),
+    legend.text = element_text(face = "italic", size = 12),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold")
+  )
+
+print(vp_ctrl_abx2)
+
+# Save to Figures folder
+fig_dir <- "Figures"
+
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE)
+}
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "Volcano_CTRL_ABX_T2_vs_CTRL_Pool.pdf"
+  ),
+  plot = vp_ctrl_abx2,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "Volcano_CTRL_ABX_T2_vs_CTRL_Pool.tiff"
+  ),
+  plot = vp_ctrl_abx2,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+
+```{r Harmonize_Phylum_Colors_Across_Volcanoes, echo=TRUE, message=FALSE}
+# Create Figures folder
+fig_dir <- "Figures"
+
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE)
+}
+
+# Collect shared Phylum levels
+all_phyla <- sort(unique(c(
+  as.character(phy_deseq_1_res_cft1$Phylum),
+  as.character(res_fop_abx2_merged$Phylum),
+  as.character(res_ctrl_abx2_merged$Phylum)
+)))
+
+all_phyla <- all_phyla[!is.na(all_phyla) & all_phyla != ""]
+
+# Shared color palette
+phylum_cols <- setNames(
+  scales::hue_pal()(length(all_phyla)),
+  all_phyla
+)
+
+# Harmonize factor levels
+phy_deseq_1_res_cft1$Phylum <- factor(
+  phy_deseq_1_res_cft1$Phylum,
+  levels = all_phyla
+)
+
+res_fop_abx2_merged$Phylum <- factor(
+  res_fop_abx2_merged$Phylum,
+  levels = all_phyla
+)
+
+res_ctrl_abx2_merged$Phylum <- factor(
+  res_ctrl_abx2_merged$Phylum,
+  levels = all_phyla
+)
+
+# Apply shared color scale
+vp1 <- vp1 + scale_color_manual(
+  values = phylum_cols,
+  drop = FALSE
+)
+
+vp_fop_abx2 <- vp_fop_abx2 + scale_color_manual(
+  values = phylum_cols,
+  drop = FALSE
+)
+
+vp_ctrl_abx2 <- vp_ctrl_abx2 + scale_color_manual(
+  values = phylum_cols,
+  drop = FALSE
+)
+
+# Re-print
+print(vp1)
+print(vp_fop_abx2)
+print(vp_ctrl_abx2)
+
+# Save harmonized versions
+ggsave(
+  filename = file.path(fig_dir, "Volcano_FOP_vs_CTRL_T1_T2_ABXT1_same.pdf"),
+  plot = vp1,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Volcano_FOP_vs_CTRL_T1_T2_ABXT1_same.tiff"),
+  plot = vp1,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Volcano_FOP_ABX_T2_vs_FOP_Pool_same.pdf"),
+  plot = vp_fop_abx2,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Volcano_FOP_ABX_T2_vs_FOP_Pool_same.tiff"),
+  plot = vp_fop_abx2,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Volcano_CTRL_ABX_T2_vs_CTRL_Pool_same.pdf"),
+  plot = vp_ctrl_abx2,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Volcano_CTRL_ABX_T2_vs_CTRL_Pool_same.tiff"),
+  plot = vp_ctrl_abx2,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+```{r Heatmap_sig_species_WT_GMA_vs_WT_pool_AVERAGED, echo=TRUE, message=FALSE, fig.width=7, fig.height=7}
+# Significant Feature IDs
+sig_ids <- res_ctrl_abx2_merged %>%
+  dplyr::filter(!is.na(padj), padj < 0.05) %>%
+  dplyr::pull(FeatureID) %>%
+  unique()
+
+if (length(sig_ids) == 0) {
+  stop("No significant features for WT GMA vs WT pool.")
+}
+
+# Normalized counts from DESeq object
+nc <- counts(dds_ctrl_abx2, normalized = TRUE)
+sig_ids <- intersect(sig_ids, rownames(nc))
+nc_sig <- nc[sig_ids, , drop = FALSE]
+
+# Map FeatureID to Species
+tax_ctrl <- as.data.frame(tax_table(ps_ctrl_abx2))
+tax_ctrl$FeatureID <- rownames(tax_ctrl)
+
+species_vec <- tax_ctrl$Species[match(rownames(nc_sig), tax_ctrl$FeatureID)]
+names(species_vec) <- rownames(nc_sig)
+
+# Remove features with no species name
+keep_rows <- which(!is.na(species_vec) & species_vec != "")
+nc_sig <- nc_sig[keep_rows, , drop = FALSE]
+species_vec <- species_vec[keep_rows]
+
+# Aggregate FeatureIDs to Species
+mat_species <- rowsum(nc_sig, group = species_vec)
+
+# Sample metadata and type renaming
+md <- as.data.frame(sample_data(ps_ctrl_abx2))
+
+md$TypeRenamed <- md$Type
+md$TypeRenamed <- gsub("^CTRL", "WT", md$TypeRenamed)
+md$TypeRenamed <- gsub("ABX", "GMA", md$TypeRenamed)
+
+keep_types <- c("WT_T1", "WT_T2", "WT_GMA_T1", "WT_GMA_T2")
+keep_samples <- rownames(md)[md$TypeRenamed %in% keep_types]
+keep_samples <- intersect(keep_samples, colnames(mat_species))
+
+mat_species <- mat_species[, keep_samples, drop = FALSE]
+md <- md[keep_samples, , drop = FALSE]
+
+# Average across TypeRenamed
+mat_long <- as.data.frame(t(mat_species))
+mat_long$TypeRenamed <- md$TypeRenamed
+
+mat_avg <- mat_long %>%
+  dplyr::group_by(TypeRenamed) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), mean)) %>%
+  as.data.frame()
+
+rownames(mat_avg) <- mat_avg$TypeRenamed
+mat_avg <- mat_avg[, -1, drop = FALSE]
+
+# Species as rows, Types as columns
+mat_avg <- t(mat_avg)
+
+desired_order <- c("WT_T1", "WT_T2", "WT_GMA_T1", "WT_GMA_T2")
+desired_order <- desired_order[desired_order %in% colnames(mat_avg)]
+mat_avg <- mat_avg[, desired_order, drop = FALSE]
+
+# Log transform and row z-score
+mat_log <- log10(mat_avg + 1)
+mat_z <- t(scale(t(mat_log)))
+
+# Row annotation: Phylum
+species_to_phylum <- tax_ctrl %>%
+  dplyr::filter(Species %in% rownames(mat_z)) %>%
+  dplyr::select(Species, Phylum) %>%
+  dplyr::distinct()
+
+ann_row <- data.frame(Phylum = species_to_phylum$Phylum)
+rownames(ann_row) <- species_to_phylum$Species
+ann_row <- ann_row[rownames(mat_z), , drop = FALSE]
+
+phy_lvls <- sort(unique(stats::na.omit(ann_row$Phylum)))
+phy_cols_hm <- phylum_cols[phy_lvls]
+
+# Column annotation
+ann_col <- data.frame(
+  Type = colnames(mat_z),
+  Group = ifelse(colnames(mat_z) == "WT_GMA_T2", "WT_GMA", "WT")
+)
+rownames(ann_col) <- colnames(mat_z)
+
+ann_colors <- list(
+  Phylum = phy_cols_hm,
+  Group = c(WT = "#999999", WT_GMA = "#000000")
+)
+
+# Plot heatmap
+pal <- colorRampPalette(c("#2166AC", "white", "#B2182B"))
+
+pheatmap(
+  mat_z,
+  color = pal(101),
+  breaks = seq(-3, 3, length.out = 101),
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_row = ann_row,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  fontsize_col = 15,
+  angle_col = 45,
+  border_color = NA,
+  main = "Significant Species (WT GMA vs WT, averaged by Type)"
+)
+
+# Save heatmap to Figures folder
+ht <- grid::grid.grab()
+
+grDevices::pdf(
+  file = file.path(fig_dir, "WT_GMA_vs_WT_species_heatmap.pdf"),
+  width = 10,
+  height = 12,
+  useDingbats = FALSE
+)
+grid::grid.draw(ht)
+dev.off()
+
+grDevices::tiff(
+  file = file.path(fig_dir, "WT_GMA_vs_WT_species_heatmap.tiff"),
+  width = 10,
+  height = 12,
+  units = "in",
+  res = 300,
+  compression = "lzw"
+)
+grid::grid.draw(ht)
+dev.off()
+```
+
+
+```{r Heatmap_sig_species_FOP_GMA_vs_FOP_pool_AVERAGED, echo=TRUE, message=FALSE, fig.width=7, fig.height=7}
+# Significant Feature IDs
+sig_ids <- res_fop_abx2_merged %>%
+  dplyr::filter(!is.na(padj), padj < 0.05) %>%
+  dplyr::pull(FeatureID) %>%
+  unique()
+
+if (length(sig_ids) == 0) {
+  stop("No significant features for FOP GMA vs FOP pool.")
+}
+
+# Normalized counts from DESeq object
+nc <- counts(dds_fop_abx2, normalized = TRUE)
+sig_ids <- intersect(sig_ids, rownames(nc))
+nc_sig <- nc[sig_ids, , drop = FALSE]
+
+# Map FeatureID to Species
+tax_fop <- as.data.frame(tax_table(ps_fop_abx2))
+tax_fop$FeatureID <- rownames(tax_fop)
+
+species_vec <- tax_fop$Species[match(rownames(nc_sig), tax_fop$FeatureID)]
+names(species_vec) <- rownames(nc_sig)
+
+# Remove rows with no species name
+keep_rows <- which(!is.na(species_vec) & species_vec != "")
+nc_sig <- nc_sig[keep_rows, , drop = FALSE]
+species_vec <- species_vec[keep_rows]
+
+# Aggregate FeatureIDs to Species
+mat_species <- rowsum(nc_sig, group = species_vec)
+
+# Sample metadata and type renaming
+md <- as.data.frame(sample_data(ps_fop_abx2))
+
+md$TypeRenamed <- md$Type
+md$TypeRenamed <- gsub("ABX", "GMA", md$TypeRenamed)
+
+keep_types <- c("FOP_T1", "FOP_T2", "FOP_GMA_T1", "FOP_GMA_T2")
+keep_samples <- rownames(md)[md$TypeRenamed %in% keep_types]
+keep_samples <- intersect(keep_samples, colnames(mat_species))
+
+mat_species <- mat_species[, keep_samples, drop = FALSE]
+md <- md[keep_samples, , drop = FALSE]
+
+# Average across TypeRenamed
+mat_long <- as.data.frame(t(mat_species))
+mat_long$TypeRenamed <- md$TypeRenamed
+
+mat_avg <- mat_long %>%
+  dplyr::group_by(TypeRenamed) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), mean)) %>%
+  as.data.frame()
+
+rownames(mat_avg) <- mat_avg$TypeRenamed
+mat_avg <- mat_avg[, -1, drop = FALSE]
+
+# Species as rows, Types as columns
+mat_avg <- t(mat_avg)
+
+desired_order <- c("FOP_T1", "FOP_T2", "FOP_GMA_T1", "FOP_GMA_T2")
+desired_order <- desired_order[desired_order %in% colnames(mat_avg)]
+mat_avg <- mat_avg[, desired_order, drop = FALSE]
+
+# Log transform and row z-score
+mat_log <- log10(mat_avg + 1)
+mat_z <- t(scale(t(mat_log)))
+
+# Row annotation: Phylum
+species_to_phylum <- tax_fop %>%
+  dplyr::filter(Species %in% rownames(mat_z)) %>%
+  dplyr::select(Species, Phylum) %>%
+  dplyr::distinct()
+
+ann_row <- data.frame(Phylum = species_to_phylum$Phylum)
+rownames(ann_row) <- species_to_phylum$Species
+ann_row <- ann_row[rownames(mat_z), , drop = FALSE]
+
+phy_lvls <- sort(unique(stats::na.omit(ann_row$Phylum)))
+phy_cols_hm <- phylum_cols[phy_lvls]
+
+# Column annotation
+ann_col <- data.frame(
+  Type = colnames(mat_z),
+  Group = ifelse(colnames(mat_z) == "FOP_GMA_T2", "FOP_GMA", "FOP")
+)
+rownames(ann_col) <- colnames(mat_z)
+
+ann_colors <- list(
+  Phylum = phy_cols_hm,
+  Group = c(FOP = "#999999", FOP_GMA = "#000000")
+)
+
+# Plot heatmap
+pal <- colorRampPalette(c("#2166AC", "white", "#B2182B"))
+
+pheatmap(
+  mat_z,
+  color = pal(101),
+  breaks = seq(-3, 3, length.out = 101),
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_row = ann_row,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  fontsize_col = 15,
+  angle_col = 45,
+  border_color = NA,
+  main = "Significant Species (FOP GMA vs FOP, averaged by Type)"
+)
+
+# Save heatmap to Figures folder
+ht <- grid::grid.grab()
+
+grDevices::pdf(
+  file = file.path(fig_dir, "FOP_GMA_vs_FOP_species_heatmap.pdf"),
+  width = 10,
+  height = 12,
+  useDingbats = FALSE
+)
+grid::grid.draw(ht)
+dev.off()
+
+grDevices::tiff(
+  file = file.path(fig_dir, "FOP_GMA_vs_FOP_species_heatmap.tiff"),
+  width = 10,
+  height = 12,
+  units = "in",
+  res = 300,
+  compression = "lzw"
+)
+grid::grid.draw(ht)
+dev.off()
+```
+```{r Heatmap_sig_species_FOP_vs_WT_pool_AVERAGED, echo=TRUE, message=FALSE, fig.width=7, fig.height=7}
+# Significant Feature IDs
+sig_ids <- phy_deseq_1_res_cft1 %>%
+  dplyr::filter(!is.na(padj), padj < 0.05) %>%
+  dplyr::pull(FeatureID) %>%
+  unique()
+
+if (length(sig_ids) == 0) {
+  stop("No significant features for FOP vs WT pool.")
+}
+
+# Normalized counts from DESeq object
+nc <- counts(phy_deseq_1, normalized = TRUE)
+sig_ids <- intersect(sig_ids, rownames(nc))
+nc_sig <- nc[sig_ids, , drop = FALSE]
+
+# Map FeatureID to Species
+tax_all <- as.data.frame(tax_table(ps_filtered))
+tax_all$FeatureID <- rownames(tax_all)
+
+species_vec <- tax_all$Species[match(rownames(nc_sig), tax_all$FeatureID)]
+names(species_vec) <- rownames(nc_sig)
+
+keep_rows <- which(!is.na(species_vec) & species_vec != "")
+nc_sig <- nc_sig[keep_rows, , drop = FALSE]
+species_vec <- species_vec[keep_rows]
+
+# Aggregate FeatureIDs to Species
+mat_species <- rowsum(nc_sig, group = species_vec)
+
+# Sample metadata and type renaming
+md <- as.data.frame(sample_data(ps_filtered))
+
+md$TypeRenamed <- md$Type
+md$TypeRenamed <- gsub("^CTRL", "WT", md$TypeRenamed)
+md$TypeRenamed <- gsub("ABX", "GMA", md$TypeRenamed)
+
+keep_types <- c(
+  "WT_T1", "WT_T2", "WT_GMA_T1",
+  "FOP_T1", "FOP_T2", "FOP_GMA_T1"
+)
+
+keep_samples <- rownames(md)[md$TypeRenamed %in% keep_types]
+keep_samples <- intersect(keep_samples, colnames(mat_species))
+
+mat_species <- mat_species[, keep_samples, drop = FALSE]
+md <- md[keep_samples, , drop = FALSE]
+
+# Average across TypeRenamed
+mat_long <- as.data.frame(t(mat_species))
+mat_long$TypeRenamed <- md$TypeRenamed
+
+mat_avg <- mat_long %>%
+  dplyr::group_by(TypeRenamed) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), mean)) %>%
+  as.data.frame()
+
+rownames(mat_avg) <- mat_avg$TypeRenamed
+mat_avg <- mat_avg[, -1, drop = FALSE]
+
+# Species as rows, Types as columns
+mat_avg <- t(mat_avg)
+
+desired_order <- c(
+  "WT_T1", "WT_T2", "WT_GMA_T1",
+  "FOP_T1", "FOP_T2", "FOP_GMA_T1"
+)
+desired_order <- desired_order[desired_order %in% colnames(mat_avg)]
+mat_avg <- mat_avg[, desired_order, drop = FALSE]
+
+# Log transform and row z-score
+mat_log <- log10(mat_avg + 1)
+mat_z <- t(scale(t(mat_log)))
+
+# Row annotation: Phylum
+species_to_phylum <- tax_all %>%
+  dplyr::filter(Species %in% rownames(mat_z)) %>%
+  dplyr::select(Species, Phylum) %>%
+  dplyr::distinct()
+
+ann_row <- data.frame(Phylum = species_to_phylum$Phylum)
+rownames(ann_row) <- species_to_phylum$Species
+ann_row <- ann_row[rownames(mat_z), , drop = FALSE]
+
+phy_lvls <- sort(unique(stats::na.omit(ann_row$Phylum)))
+phy_cols_hm <- phylum_cols[phy_lvls]
+
+# Column annotation
+ann_col <- data.frame(
+  Type = colnames(mat_z),
+  Group = ifelse(grepl("^WT", colnames(mat_z)), "WT", "FOP")
+)
+rownames(ann_col) <- colnames(mat_z)
+
+ann_colors <- list(
+  Phylum = phy_cols_hm,
+  Group = c(WT = "#999999", FOP = "#000000")
+)
+
+# Plot heatmap
+pal <- colorRampPalette(c("#2166AC", "white", "#B2182B"))
+
+pheatmap(
+  mat_z,
+  color = pal(101),
+  breaks = seq(-3, 3, length.out = 101),
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  annotation_row = ann_row,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  fontsize_col = 15,
+  angle_col = 45,
+  border_color = NA,
+  main = "Significant Species (FOP vs WT pool, averaged by Type)"
+)
+
+# Save heatmap to Figures folder
+ht <- grid::grid.grab()
+
+grDevices::pdf(
+  file = file.path(fig_dir, "FOP_vs_WT_pool_species_heatmap.pdf"),
+  width = 10,
+  height = 12,
+  useDingbats = FALSE
+)
+grid::grid.draw(ht)
+dev.off()
+
+grDevices::tiff(
+  file = file.path(fig_dir, "FOP_vs_WT_pool_species_heatmap.tiff"),
+  width = 10,
+  height = 12,
+  units = "in",
+  res = 300,
+  compression = "lzw"
+)
+grid::grid.draw(ht)
+dev.off()
+```
